@@ -21,6 +21,14 @@ import subprocess
 import sys
 import winreg
 
+# 输出编码防护:非 GBK 环境(如 GitHub Actions runner 的 Python 默认 cp1252)打中文会
+# UnicodeEncodeError 直接崩构建;errors="replace" 只把编不了的字符换成 "?",不改默认
+# 编码,本机 GBK 控制台显示不变。stdout 为 None(如 pythonw)时跳过。
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "keep_awake_tray.cs")
 BUILD_DIR = os.path.join(HERE, "build")

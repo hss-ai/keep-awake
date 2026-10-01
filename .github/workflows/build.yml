@@ -26,6 +26,9 @@ jobs:
 
       - name: Build KeepAwake.exe
         run: python build_keep_awake.py --build-only
+        env:
+          # runner 上 Python 默认 cp1252,中文 print 会 UnicodeEncodeError 崩构建
+          PYTHONUTF8: "1"
 
       - name: Generate sha256
         shell: pwsh
