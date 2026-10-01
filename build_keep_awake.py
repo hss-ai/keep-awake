@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs → KeepAwake.exe)一键构建
+"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs + explorer_tab_merge.cs → KeepAwake.exe)一键构建
 
 流程:
   1) PIL 生成 keep_awake.ico(绿圆底+白咖啡杯,与托盘三态图标同款设计);
@@ -10,7 +10,7 @@
 用法:python build_keep_awake.py                (默认全流程:构建+装机+桌面快捷方式)
       python build_keep_awake.py --build-only  (仅生成图标并编译到 build/KeepAwake.exe,
                                                 CI 用:跳过停旧进程/装机/建快捷方式)
-      (在本仓库根目录跑,keep_awake_tray.cs 须同目录)
+      (在本仓库根目录跑,两个 .cs 源文件须同目录)
 依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319。
 重复跑 = 重建覆盖(覆盖前自动停掉在跑的旧实例)。
 """
@@ -30,7 +30,10 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "keep_awake_tray.cs")
+SRC_FILES = [
+    os.path.join(HERE, "keep_awake_tray.cs"),       # 托盘主程序(防待机 + 菜单)
+    os.path.join(HERE, "explorer_tab_merge.cs"),    # 资源管理器单窗口合并(dynamic COM 需 Microsoft.CSharp)
+]
 BUILD_DIR = os.path.join(HERE, "build")
 CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
@@ -85,8 +88,9 @@ def make_shortcut(exe_path: str, lnk_path: str) -> None:
 
 def main() -> int:
     build_only = "--build-only" in sys.argv
-    if not os.path.isfile(SRC):
-        raise SystemExit(f"源码不存在:{SRC}")
+    for src_file in SRC_FILES:
+        if not os.path.isfile(src_file):
+            raise SystemExit(f"源码不存在:{src_file}")
     if not os.path.isfile(CSC):
         raise SystemExit(f"未找到系统 csc(这台机器没装 .NET Framework?):{CSC}")
 
@@ -100,8 +104,8 @@ def main() -> int:
     compile_cmd = [
         CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
         "/win32icon:" + ico, "/out:" + out_exe,
-        "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll",
-        SRC,
+        "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:Microsoft.CSharp.dll",
+        *SRC_FILES,
     ]
     result = subprocess.run(compile_cmd, capture_output=True)
     if result.returncode != 0 or not os.path.isfile(out_exe):
