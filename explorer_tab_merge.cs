@@ -233,6 +233,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
 
         IntPtr target = FindTargetWindow(newHwnd);
         if (target == IntPtr.Zero) { Log("无既有窗口,保留为首窗"); return; }
+        Log("合并前标签快照: " + TabsSnapshot(target));
 
         bool merged = false;
         if (path.Length > 0) {
@@ -294,7 +295,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
         Thread.Sleep(300);                       // 等关窗后的焦点归还尘埃落定
         ShowTargetToUser(target);                // 还原最小化 + 尽力带到眼前(不注入按键)
         Log("并入完成 " + target + (path.Length == 0 ? "(主页标签)" : " → " + path)
-            + " 最终最小化=" + IsIconic(target));
+            + " 最终最小化=" + IsIconic(target) + " 合并后标签快照: " + TabsSnapshot(target));
     }
 
     /// <summary>合并完成后把目标窗口带回用户眼前:最小化则还原(还原自带激活);
@@ -326,9 +327,66 @@ internal sealed class ExplorerTabMerger : IDisposable {
         return false;
     }
 
-    /// <summary>在目标窗口里以新标签打开 path:IWebBrowser2.Navigate2 + navOpenInNewTab(0x800)。
-    /// 零按键、不吃输入法、不依赖前台。</summary>
+    /// <summary>在目标窗口里开出指向 path 的新标签。实测(PowerShell 对照实验,2026-10-01):
+    /// 本机 Win11 的 IWebBrowser2.Navigate2 对 navOpenInNewTab(0x800)/InBackgroundTab(0x1000)
+    /// 一律原地导航——会把既有标签顶掉(v1.2.1 之前「老目录被关掉」的真凶)。
+    /// 可靠组合:UIA 调用标签栏 AddButton 开出真新标签(落在主页,LocationURL 为空),
+    /// 再对这条新增的空标签原地 Navigate2 到目标路径。全程零键盘:不吃输入法、不依赖前台。</summary>
     private static bool NavigateNewTab(IntPtr targetHwnd, string path) {
+        int emptyBefore = CountEmptyTabs(targetHwnd);
+        try {
+            var root = System.Windows.Automation.AutomationElement.FromHandle(targetHwnd);
+            var cond = new System.Windows.Automation.PropertyCondition(
+                System.Windows.Automation.AutomationElement.AutomationIdProperty, "AddButton");
+            var btn = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, cond);
+            if (btn == null) {
+                Log("未找到标签栏 AddButton(Win10 无标签页?)");
+                return false;
+            }
+            var inv = (System.Windows.Automation.InvokePattern)btn.GetCurrentPattern(
+                System.Windows.Automation.InvokePattern.Pattern);
+            inv.Invoke();
+        } catch (Exception ex) {
+            Log("UIA 新标签失败: " + ex.Message);
+            return false;
+        }
+        // 等新增的空标签出现(空标签计数恰好 +1 才动手,防止误导航用户自己的主页标签)
+        for (int i = 0; i < 12; i++) {
+            Thread.Sleep(150);
+            if (CountEmptyTabs(targetHwnd) == emptyBefore + 1) {
+                return NavigateEmptyTab(targetHwnd, path);
+            }
+        }
+        Log("AddButton 调用后未见新增空标签");
+        return false;
+    }
+
+    /// <summary>目标窗口下 LocationURL 为空(主页/虚拟位置)的标签条数。</summary>
+    private static int CountEmptyTabs(IntPtr hwnd) {
+        int n = 0;
+        try {
+            Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+            dynamic shellWindows = Activator.CreateInstance(t);
+            try {
+                foreach (dynamic w in shellWindows) {
+                    try {
+                        if (new IntPtr(Convert.ToInt64(w.HWND)) != hwnd) continue;
+                        if (string.IsNullOrEmpty((string)w.LocationURL)) n++;
+                    } catch {
+                    } finally {
+                        try { Marshal.ReleaseComObject(w); } catch { }
+                    }
+                }
+            } finally {
+                try { Marshal.ReleaseComObject(shellWindows); } catch { }
+            }
+        } catch {
+        }
+        return n;
+    }
+
+    /// <summary>把目标窗口下一条空 URL 标签原地导航到 path(只应在"刚新增了空标签"后调用)。</summary>
+    private static bool NavigateEmptyTab(IntPtr targetHwnd, string path) {
         try {
             Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
             dynamic shellWindows = Activator.CreateInstance(t);
@@ -336,7 +394,8 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 foreach (dynamic w in shellWindows) {
                     try {
                         if (new IntPtr(Convert.ToInt64(w.HWND)) != targetHwnd) continue;
-                        w.Navigate2(path, 0x800);            // navOpenInNewTab
+                        if (!string.IsNullOrEmpty((string)w.LocationURL)) continue;
+                        w.Navigate2(path, 0);        // 原地导航这条新开的主页标签
                         return true;
                     } catch {
                     } finally {

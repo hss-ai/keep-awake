@@ -68,15 +68,24 @@ def wait_count(target, timeout=8.0):
     return len(explorer_windows()) == target
 
 
+def title_of(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    return buf.value if user32.GetWindowTextW(hwnd, buf, 256) else ""
+
+
 def ctrl_w_if_explorer_fg():
+    """仅当前台是资源管理器且活动标签是本测试目录(标题含 ka_merge)时才发 Ctrl+W——
+    绝不碰用户自己的标签(仅凭"前台是资源管理器"就关,会误关用户的活动标签)。"""
     fg = user32.GetForegroundWindow()
-    if fg and class_of(fg) == CABINET:
-        user32.keybd_event(0x11, 0, 0, 0)   # Ctrl
-        user32.keybd_event(0x57, 0, 0, 0)   # W
-        user32.keybd_event(0x57, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        return True
-    return False
+    if not fg or class_of(fg) != CABINET:
+        return False
+    if "ka_merge" not in title_of(fg):
+        return False
+    user32.keybd_event(0x11, 0, 0, 0)   # Ctrl
+    user32.keybd_event(0x57, 0, 0, 0)   # W
+    user32.keybd_event(0x57, 0, 2, 0)
+    user32.keybd_event(0x11, 0, 2, 0)
+    return True
 
 
 def kill_keepawake():

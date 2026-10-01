@@ -56,6 +56,16 @@ def make_ico(path: str) -> None:
     img.save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 
 
+def find_gac_assembly(name: str) -> str:
+    """csc 不探测 GAC,UIAutomation 系程序集只存在于 GAC;按名解析绝对路径。"""
+    import glob
+    for arch in ("GAC_MSIL", "GAC_64", "GAC_32"):
+        hits = glob.glob(rf"C:\Windows\Microsoft.NET\assembly\{arch}\{name}\v4.0_*\{name}.dll")
+        if hits:
+            return hits[0]
+    raise SystemExit(f"未在 GAC 找到 {name}.dll(这台机器 .NET Framework 不完整?)")
+
+
 def desktop_dir() -> str:
     try:
         with winreg.OpenKey(
@@ -105,6 +115,8 @@ def main() -> int:
         CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
         "/win32icon:" + ico, "/out:" + out_exe,
         "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:Microsoft.CSharp.dll",
+        "/r:" + find_gac_assembly("UIAutomationClient"),
+        "/r:" + find_gac_assembly("UIAutomationTypes"),
         *SRC_FILES,
     ]
     result = subprocess.run(compile_cmd, capture_output=True)

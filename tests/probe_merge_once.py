@@ -55,14 +55,18 @@ def pwsh(cmd):
 
 
 def ctrl_w_if_explorer_fg():
+    """仅当前台资源管理器的活动标签是本探针目录(标题含 kaProbe)时才发 Ctrl+W——
+    绝不碰用户自己的标签。"""
     fg = user32.GetForegroundWindow()
-    if fg and class_of(fg) == CABINET:
-        user32.keybd_event(0x11, 0, 0, 0)
-        user32.keybd_event(0x57, 0, 0, 0)
-        user32.keybd_event(0x57, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        return True
-    return False
+    if not fg or class_of(fg) != CABINET:
+        return False
+    if "kaProbe" not in title_of(fg):
+        return False
+    user32.keybd_event(0x11, 0, 0, 0)
+    user32.keybd_event(0x57, 0, 0, 0)
+    user32.keybd_event(0x57, 0, 2, 0)
+    user32.keybd_event(0x11, 0, 2, 0)
+    return True
 
 
 def main():
