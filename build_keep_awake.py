@@ -7,7 +7,10 @@
   3) 安装到 %USERPROFILE%\\Scripts\\KeepAwake.exe(C 盘用户工具目录);
   4) 桌面建「防待机.lnk」快捷方式(桌面路径从注册表 User Shell Folders 读,防 OneDrive 重定向)。
 
-用法:python build_keep_awake.py   (在本仓库根目录跑,keep_awake_tray.cs 须同目录)
+用法:python build_keep_awake.py                (默认全流程:构建+装机+桌面快捷方式)
+      python build_keep_awake.py --build-only  (仅生成图标并编译到 build/KeepAwake.exe,
+                                                CI 用:跳过停旧进程/装机/建快捷方式)
+      (在本仓库根目录跑,keep_awake_tray.cs 须同目录)
 依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319。
 重复跑 = 重建覆盖(覆盖前自动停掉在跑的旧实例)。
 """
@@ -73,6 +76,7 @@ def make_shortcut(exe_path: str, lnk_path: str) -> None:
 
 
 def main() -> int:
+    build_only = "--build-only" in sys.argv
     if not os.path.isfile(SRC):
         raise SystemExit(f"源码不存在:{SRC}")
     if not os.path.isfile(CSC):
@@ -98,6 +102,10 @@ def main() -> int:
         raise SystemExit("csc 编译失败")
     size_kb = os.path.getsize(out_exe) / 1024
     print(f"[2/4] 编译完成:{out_exe}({size_kb:.0f} KB)")
+
+    if build_only:
+        print("完成(--build-only:仅构建,未停旧进程/未装机/未建快捷方式)。")
+        return 0
 
     dest_dir = os.path.join(os.environ["USERPROFILE"], "Scripts")
     os.makedirs(dest_dir, exist_ok=True)
