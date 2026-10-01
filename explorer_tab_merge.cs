@@ -69,6 +69,8 @@ internal sealed class ExplorerTabMerger : IDisposable {
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")]
     private static extern IntPtr GetFocus();
     [DllImport("imm32.dll")]
     private static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
@@ -88,6 +90,10 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private const int SW_RESTORE = 9;
     private const uint WM_CLOSE = 0x0010;
     private const int SW_MINIMIZE = 6;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -285,8 +291,22 @@ internal sealed class ExplorerTabMerger : IDisposable {
         if (IsWindow(newHwnd)) {
             PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
         }
-        ForceForeground(target);                              // 尽力把目标窗口带到用户眼前,成败不计
-        Log("并入完成 " + target + (path.Length == 0 ? "(主页标签)" : " → " + path));
+        Thread.Sleep(300);                       // 等关窗后的焦点归还尘埃落定
+        ShowTargetToUser(target);                // 还原最小化 + 尽力带到眼前(不注入按键)
+        Log("并入完成 " + target + (path.Length == 0 ? "(主页标签)" : " → " + path)
+            + " 最终最小化=" + IsIconic(target));
+    }
+
+    /// <summary>合并完成后把目标窗口带回用户眼前:最小化则还原(还原自带激活);
+    /// 置前被前台锁拒绝时,至少把 z 序抬到顶层(SWP_NOACTIVATE 不抢焦点、无需前台权限)。
+    /// 这里刻意不注入 Alt 键——那会打搅用户正在用的应用,只留给键盘兜底路径用。</summary>
+    private static void ShowTargetToUser(IntPtr target) {
+        if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+        SetForegroundWindow(target);
+        if (GetForegroundWindow() != target) {
+            SetWindowPos(target, IntPtr.Zero /* HWND_TOP */, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        }
     }
 
     /// <summary>把目标窗口置前并核实(带最小化/还原强制激活兜底)。失败返回 false——
