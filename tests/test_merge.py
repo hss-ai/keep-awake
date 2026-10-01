@@ -140,7 +140,9 @@ def main():
         kill_keepawake()
         time.sleep(0.5)
         if had_running:
-            subprocess.Popen([restore_path])
+            # 恢复启动必须用 os.startfile(ShellExecute):普通 Popen 挂在本测试的进程组里,
+            # 测试命令结束时整组被回收,会把用户的托盘程序一起带走(图标消失的实锤坑)
+            os.startfile(restore_path)
         for d in (dir_a, dir_b):
             shutil.rmtree(d, ignore_errors=True)
 

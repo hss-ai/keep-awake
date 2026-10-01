@@ -99,7 +99,8 @@ def main():
         pwsh("Stop-Process -Name KeepAwake -ErrorAction SilentlyContinue")
         time.sleep(0.4)
         if had_running:
-            subprocess.Popen([restore])
+            # os.startfile(ShellExecute)脱离测试进程组;Popen 会被命令结束连带回收,图标会消失
+            os.startfile(restore)
         shutil.rmtree(probe_dir, ignore_errors=True)
 
     print("PASS" if ok else "FAIL")
