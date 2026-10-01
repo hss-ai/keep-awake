@@ -1,0 +1,119 @@
+# -*- coding: utf-8 -*-
+"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs → KeepAwake.exe)一键构建
+
+流程:
+  1) PIL 生成 keep_awake.ico(绿圆底+白咖啡杯,与托盘三态图标同款设计);
+  2) 用 Windows 自带的 .NET Framework csc 编译(免装任何构建链,exe 仅几十 KB);
+  3) 安装到 %USERPROFILE%\\Scripts\\KeepAwake.exe(C 盘用户工具目录);
+  4) 桌面建「防待机.lnk」快捷方式(桌面路径从注册表 User Shell Folders 读,防 OneDrive 重定向)。
+
+用法:python build_keep_awake.py   (在本仓库根目录跑,keep_awake_tray.cs 须同目录)
+依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319。
+重复跑 = 重建覆盖(覆盖前自动停掉在跑的旧实例)。
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import winreg
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, "keep_awake_tray.cs")
+BUILD_DIR = os.path.join(HERE, "build")
+CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+SHORTCUT_NAME = "防待机.lnk"
+GREEN = (39, 174, 96, 255)  # 与 cs 里 iconOn 同色
+
+
+def make_ico(path: str) -> None:
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([8, 8, 248, 248], fill=GREEN)
+    white = (255, 255, 255, 255)
+    d.rectangle([76, 104, 180, 124], fill=white)   # 杯口沿
+    d.rectangle([88, 120, 168, 208], fill=white)   # 杯身
+    d.arc([168, 128, 232, 184], -80, 110, fill=white, width=14)  # 杯柄
+    d.line([108, 56, 108, 92], fill=white, width=14)             # 蒸汽×2
+    d.line([148, 56, 148, 92], fill=white, width=14)
+    img.save(path, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+
+
+def desktop_dir() -> str:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "Desktop")
+        return os.path.expandvars(val)
+    except OSError:
+        return os.path.join(os.environ["USERPROFILE"], "Desktop")
+
+
+def make_shortcut(exe_path: str, lnk_path: str) -> None:
+    # .lnk 走 WScript.Shell COM,经 pwsh 落地;subprocess 列表参数走 CreateProcessW,中文无损
+    cmd = (
+        "$sh = New-Object -ComObject WScript.Shell; "
+        "$lnk = $sh.CreateShortcut('{lnk}'); "
+        "$lnk.TargetPath='{exe}'; "
+        "$lnk.WorkingDirectory='{wdir}'; "
+        "$lnk.Description='{desc}'; "
+        "$lnk.IconLocation='{exe},0'; "
+        "$lnk.Save()"
+    ).format(lnk=lnk_path, exe=exe_path, wdir=os.path.dirname(exe_path), desc="防待机托盘开关(左键开关,右键退出)")
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", cmd], capture_output=True)
+    if result.returncode != 0:
+        print(result.stdout.decode("gbk", "replace"))
+        print(result.stderr.decode("gbk", "replace"))
+        raise SystemExit("快捷方式创建失败")
+
+
+def main() -> int:
+    if not os.path.isfile(SRC):
+        raise SystemExit(f"源码不存在:{SRC}")
+    if not os.path.isfile(CSC):
+        raise SystemExit(f"未找到系统 csc(这台机器没装 .NET Framework?):{CSC}")
+
+    os.makedirs(BUILD_DIR, exist_ok=True)
+    ico = os.path.join(BUILD_DIR, "keep_awake.ico")
+    out_exe = os.path.join(BUILD_DIR, "KeepAwake.exe")
+
+    make_ico(ico)
+    print(f"[1/4] 图标已生成:{ico}")
+
+    compile_cmd = [
+        CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
+        "/win32icon:" + ico, "/out:" + out_exe,
+        "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll",
+        SRC,
+    ]
+    result = subprocess.run(compile_cmd, capture_output=True)
+    if result.returncode != 0 or not os.path.isfile(out_exe):
+        print(result.stdout.decode("gbk", "replace"))
+        print(result.stderr.decode("gbk", "replace"))
+        raise SystemExit("csc 编译失败")
+    size_kb = os.path.getsize(out_exe) / 1024
+    print(f"[2/4] 编译完成:{out_exe}({size_kb:.0f} KB)")
+
+    dest_dir = os.path.join(os.environ["USERPROFILE"], "Scripts")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "KeepAwake.exe")
+    # 若旧实例在跑,先停掉再覆盖
+    subprocess.run(["pwsh", "-NoProfile", "-Command",
+                    "Stop-Process -Name KeepAwake -ErrorAction SilentlyContinue"], capture_output=True)
+    shutil.copyfile(out_exe, dest)
+    print(f"[3/4] 已安装:{dest}")
+
+    lnk = os.path.join(desktop_dir(), SHORTCUT_NAME)
+    make_shortcut(dest, lnk)
+    print(f"[4/4] 桌面快捷方式:{lnk}")
+    print("完成。双击「防待机」即启动并开始防待机;左键托盘图标开关,右键菜单可退出。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
