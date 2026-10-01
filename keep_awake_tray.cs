@@ -9,7 +9,8 @@
 //   - 启动即开启「系统防待机」(屏幕允许自动关),托盘弹气泡提示;
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
-//     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11)/ 退出;
+//     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11) /
+//     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/ 退出;
 //   - 唤醒请求只挂在本进程(SetThreadExecutionState),退出/被杀/注销系统自动撤销,不改电源计划;
 //   - Mutex 单实例:重复启动直接退出,不多开图标。
 // 注意:C# 5 语法(csc 4.0.30319 不支持 C#6+),不要用字符串插值 $""、?. 等新语法。
@@ -20,6 +21,7 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace KeepAwake {
 
@@ -50,6 +52,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miOn;
     readonly ToolStripMenuItem miDisplay;
     readonly ToolStripMenuItem miExplorer;
+    readonly ToolStripMenuItem miAutoStart;
     readonly System.Windows.Forms.Timer timer;
     readonly Icon iconOn;
     readonly Icon iconOnDisplay;
@@ -71,6 +74,8 @@ internal sealed class TrayContext : ApplicationContext {
         miDisplay.Click += OnToggleDisplay;
         miExplorer = new ToolStripMenuItem("资源管理器单窗口合并");
         miExplorer.Click += OnToggleExplorer;
+        miAutoStart = new ToolStripMenuItem("开机自启");
+        miAutoStart.Click += OnToggleAutoStart;
         var miExit = new ToolStripMenuItem("退出");
         miExit.Click += OnExit;
         menu.Items.Add(miState);
@@ -79,6 +84,7 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(miDisplay);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miExplorer);
+        menu.Items.Add(miAutoStart);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miExit);
 
@@ -97,6 +103,9 @@ internal sealed class TrayContext : ApplicationContext {
         merger = new ExplorerTabMerger();
         miExplorer.Checked = true; // 默认开启:新开的资源管理器并入既有窗口
         merger.Enabled = true;
+
+        miAutoStart.Checked = AutoStartEnabled();
+        if (miAutoStart.Checked) SetAutoStart(true); // 路径自愈:exe 挪窝后指向当前实例
 
         miOn.Checked = true; // 启动即开启
         RefreshState();
@@ -125,6 +134,40 @@ internal sealed class TrayContext : ApplicationContext {
     void OnToggleExplorer(object sender, EventArgs e) {
         miExplorer.Checked = !miExplorer.Checked;
         merger.Enabled = miExplorer.Checked;
+    }
+
+    void OnToggleAutoStart(object sender, EventArgs e) {
+        try {
+            SetAutoStart(!miAutoStart.Checked);
+        } catch (Exception ex) {
+            tray.BalloonTipTitle = "开机自启设置失败";
+            tray.BalloonTipText = ex.Message;
+            tray.ShowBalloonTip(2500);
+        }
+        miAutoStart.Checked = AutoStartEnabled(); // 以注册表实际状态为准
+    }
+
+    // ==== 开机自启(HKCU Run,免管理员) ====
+
+    const string RunKeyPath = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const string RunValueName = "KeepAwake";
+
+    static bool AutoStartEnabled() {
+        try {
+            using (var key = Registry.CurrentUser.OpenSubKey(RunKeyPath)) {
+                if (key == null) return false;
+                return !string.IsNullOrEmpty(key.GetValue(RunValueName) as string);
+            }
+        } catch {
+            return false;
+        }
+    }
+
+    static void SetAutoStart(bool on) {
+        using (var key = Registry.CurrentUser.CreateSubKey(RunKeyPath)) {
+            if (on) key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\"");
+            else key.DeleteValue(RunValueName, false);
+        }
     }
 
     void TrayMouseClick(object sender, MouseEventArgs e) {
