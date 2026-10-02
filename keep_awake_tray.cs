@@ -18,6 +18,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -45,10 +46,149 @@ static class Program {
     }
 }
 
+// 应用级日志:防待机开关/护栏动作/启停留痕(出问题对时间线用;512KB 自动重开)
+static class AppLog {
+    static readonly string LogPath = Path.Combine(Path.GetTempPath(), "KeepAwake_app.log");
+    public static void Write(string msg) {
+        try {
+            var fi = new FileInfo(LogPath);
+            if (fi.Exists && fi.Length > 524288) fi.Delete();
+            File.AppendAllText(LogPath,
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
+        } catch {
+        }
+    }
+}
+
+// ==== 电源护栏:防待机开启期间临时清零「在此时间后休眠」(HIBERNATEIDLE) ====
+// 为什么需要:SetThreadExecutionState 挡得住"闲置超时睡眠",挡不住 Win11 新型待机的
+// 「睡眠后休眠 - 固定超时」——2026-10-02 凌晨实测:屏幕熄灭后系统保持活跃约 4 小时,
+// 维护周期进入真睡眠,30 分钟后(机器 HIBERNATEIDLE=0x708)被强制休眠至早晨
+// (事件日志证据:Hibernate from Sleep - Fixed Timeout)。
+// 护栏:开启防待机时把 HIBERNATEIDLE(AC+DC)写 0(从不),原值备份在 HKCU;
+// 关闭/退出恢复;启动时发现未撤销的备份(上次异常退出)先自愈,保证不留残留。
+static class PowerHibernateGuard {
+    [DllImport("powrprof.dll", SetLastError = true)]
+    private static extern uint PowerGetActiveScheme(IntPtr userPowerKey, out IntPtr activeSchemeGuid);
+    [DllImport("powrprof.dll", SetLastError = true)]
+    private static extern uint PowerSetActiveScheme(IntPtr userPowerKey, ref Guid schemeGuid);
+    [DllImport("powrprof.dll", SetLastError = true)]
+    private static extern uint PowerReadACValue(IntPtr root, ref Guid scheme, ref Guid subgroup,
+        ref Guid setting, out int type, byte[] buffer, ref uint bufferSize);
+    // 注意:真导出名是 PowerWriteACValueIndex,且第 5 参直接收 DWORD 值(不是 buffer+size,
+    // 传 buffer 指针会把指针当超时写进去——实测翻车,39791600s 就是堆地址)
+    [DllImport("powrprof.dll", SetLastError = true, EntryPoint = "PowerWriteACValueIndex")]
+    private static extern uint PowerWriteAcIndex(IntPtr root, ref Guid scheme, ref Guid subgroup,
+        ref Guid setting, uint value);
+    [DllImport("powrprof.dll", SetLastError = true)]
+    private static extern uint PowerReadDCValue(IntPtr root, ref Guid scheme, ref Guid subgroup,
+        ref Guid setting, out int type, byte[] buffer, ref uint bufferSize);
+    [DllImport("powrprof.dll", SetLastError = true, EntryPoint = "PowerWriteDCValueIndex")]
+    private static extern uint PowerWriteDcIndex(IntPtr root, ref Guid scheme, ref Guid subgroup,
+        ref Guid setting, uint value);
+    [DllImport("powrprof.dll", SetLastError = true, EntryPoint = "PowerWriteDCValueIndex")]
+    private static extern uint PowerWriteDCValue(IntPtr root, ref Guid scheme, ref Guid subgroup,
+        ref Guid setting, byte[] buffer, uint bufferSize);
+
+    static Guid SubSleep = new Guid("238c9fa8-0aad-41ed-83f4-97be242c8f20");      // 不能 readonly:要按 ref 传给 P/Invoke
+    static Guid HibernateIdle = new Guid("9d7815a6-7ee4-497e-8888-515a05f02364");
+    const string RegPath = "Software\\KeepAwake";
+
+    static Guid ActiveScheme() {
+        IntPtr p;
+        if (PowerGetActiveScheme(IntPtr.Zero, out p) != 0 || p == IntPtr.Zero)
+            throw new InvalidOperationException("PowerGetActiveScheme 失败");
+        return (Guid)Marshal.PtrToStructure(p, typeof(Guid));
+    }
+
+    static uint ReadVal(bool ac, Guid scheme) {
+        int type;
+        byte[] buf = new byte[4];
+        uint size = 4;
+        uint rc = ac
+            ? PowerReadACValue(IntPtr.Zero, ref scheme, ref SubSleep, ref HibernateIdle, out type, buf, ref size)
+            : PowerReadDCValue(IntPtr.Zero, ref scheme, ref SubSleep, ref HibernateIdle, out type, buf, ref size);
+        if (rc != 0) throw new InvalidOperationException("PowerRead 失败 rc=" + rc);
+        return BitConverter.ToUInt32(buf, 0);
+    }
+
+    static void WriteVal(bool ac, Guid scheme, uint val) {
+        uint rc = ac
+            ? PowerWriteAcIndex(IntPtr.Zero, ref scheme, ref SubSleep, ref HibernateIdle, val)
+            : PowerWriteDcIndex(IntPtr.Zero, ref scheme, ref SubSleep, ref HibernateIdle, val);
+        if (rc != 0) throw new InvalidOperationException("PowerWrite 失败 rc=" + rc);
+    }
+
+    /// <summary>开启防待机时调用:清零 HIBERNATEIDLE(AC+DC),原值备份 HKCU。</summary>
+    public static void Engage() {
+        try {
+            SelfHealIfPending();                       // 上次异常退出的残留先恢复,再重新护栏
+            Guid scheme = ActiveScheme();
+            uint ac = ReadVal(true, scheme);
+            uint dc = ReadVal(false, scheme);
+            using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) {
+                key.SetValue("HibernateIdleAcBackup", ac, RegistryValueKind.DWord);
+                key.SetValue("HibernateIdleDcBackup", dc, RegistryValueKind.DWord);
+                key.SetValue("GuardPending", 1, RegistryValueKind.DWord);
+            }
+            if (ac != 0) WriteVal(true, scheme, 0);
+            if (dc != 0) WriteVal(false, scheme, 0);
+            Guid s = scheme;
+            PowerSetActiveScheme(IntPtr.Zero, ref s);   // 立即生效
+            AppLog.Write("护栏生效:睡眠后休眠 " + ac + "s/" + dc + "s → 从不(原值已备份)");
+        } catch (Exception ex) {
+            AppLog.Write("护栏 Engage 失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>关闭防待机/退出时调用:恢复原值。</summary>
+    public static void Disengage() {
+        try {
+            if (!Pending()) return;
+            Restore();
+            AppLog.Write("护栏撤销:睡眠后休眠已恢复原值");
+        } catch (Exception ex) {
+            AppLog.Write("护栏 Disengage 失败: " + ex.Message);
+        }
+    }
+
+    /// <summary>启动时调用:上次异常退出没来得及恢复的话,先恢复。</summary>
+    public static void SelfHealIfPending() {
+        try {
+            if (!Pending()) return;
+            Restore();
+            AppLog.Write("护栏自愈:发现上次未撤销的修改,已恢复原值");
+        } catch (Exception ex) {
+            AppLog.Write("护栏自愈失败: " + ex.Message);
+        }
+    }
+
+    static bool Pending() {
+        using (var key = Registry.CurrentUser.OpenSubKey(RegPath)) {
+            if (key == null) return false;
+            return Convert.ToInt32(key.GetValue("GuardPending", 0)) == 1;
+        }
+    }
+
+    static void Restore() {
+        uint ac;
+        uint dc;
+        using (var key = Registry.CurrentUser.OpenSubKey(RegPath, true)) {
+            ac = Convert.ToUInt32(key.GetValue("HibernateIdleAcBackup", 0));
+            dc = Convert.ToUInt32(key.GetValue("HibernateIdleDcBackup", 0));
+            key.SetValue("GuardPending", 0, RegistryValueKind.DWord);
+        }
+        Guid scheme = ActiveScheme();
+        WriteVal(true, scheme, ac);
+        WriteVal(false, scheme, dc);
+        Guid s = scheme;
+        PowerSetActiveScheme(IntPtr.Zero, ref s);
+    }
+}
+
 internal sealed class TrayContext : ApplicationContext {
 
-    readonly NotifyIcon tray;
-    readonly ToolStripMenuItem miState;
+    readonly NotifyIcon tray;    readonly ToolStripMenuItem miState;
     readonly ToolStripMenuItem miOn;
     readonly ToolStripMenuItem miDisplay;
     readonly ToolStripMenuItem miExplorer;
@@ -61,6 +201,8 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
+        AppLog.Write("启动(v1.3.0)");
+        PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
         iconOff = MakeIcon(Color.FromArgb(128, 128, 128));      // 灰:关闭
@@ -109,6 +251,8 @@ internal sealed class TrayContext : ApplicationContext {
 
         miOn.Checked = true; // 启动即开启
         RefreshState();
+        PowerHibernateGuard.Engage();
+        AppLog.Write("防待机:开启");
         tray.BalloonTipTitle = "防待机已开启";
         tray.BalloonTipText = "资源管理器合并已启动(新窗口并入标签)。左键图标:开/关防待机;右键菜单更多。";
         tray.ShowBalloonTip(2500);
@@ -119,6 +263,13 @@ internal sealed class TrayContext : ApplicationContext {
         if (miOn.Checked) onSince = DateTime.Now;
         else miDisplay.Checked = false; // 总开关关掉,常亮自然失效
         RefreshState();
+        if (miOn.Checked) {
+            PowerHibernateGuard.Engage();
+            AppLog.Write("防待机:开启");
+        } else {
+            PowerHibernateGuard.Disengage();
+            AppLog.Write("防待机:关闭");
+        }
     }
 
     void OnToggleDisplay(object sender, EventArgs e) {
@@ -204,6 +355,8 @@ internal sealed class TrayContext : ApplicationContext {
         miOn.Checked = false;
         miDisplay.Checked = false;
         RefreshState(); // 撤销唤醒请求,恢复系统默认
+        PowerHibernateGuard.Disengage();
+        AppLog.Write("退出");
         merger.Dispose();
         timer.Stop();
         tray.Visible = false;
