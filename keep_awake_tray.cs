@@ -35,7 +35,12 @@ static class Program {
     internal const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
     [STAThread]
-    static void Main() {
+    static void Main(string[] args) {
+        // 维护开关:进程被强杀/崩溃留下护栏残留时,手动一键恢复电源设置(正常退出不需要)
+        if (args.Length > 0 && args[0] == "--restore-power") {
+            PowerHibernateGuard.SelfHealIfPending();
+            return;
+        }
         bool createdNew;
         using (var single = new Mutex(true, "Local\\KeepAwake_Tray_SingleInstance", out createdNew)) {
             if (!createdNew) return; // 已有实例,静默退出
@@ -185,6 +190,7 @@ static class PowerHibernateGuard {
         }
         Guid s = scheme;
         PowerSetActiveScheme(IntPtr.Zero, ref s);
+        Registry.CurrentUser.DeleteSubKey(RegPath, false);   // 恢复完毕,配置键删净
     }
 }
 
@@ -203,7 +209,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.3.0)");
+        AppLog.Write("启动(v1.3.2)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -238,6 +244,8 @@ internal sealed class TrayContext : ApplicationContext {
         tray.Text = "防待机";
         tray.Visible = true;
         tray.MouseClick += TrayMouseClick;
+        // 注销/关机时进程会被直接终止,没机会走菜单退出——挂会话事件,临终前恢复系统设置
+        SystemEvents.SessionEnding += OnSessionEnding;
 
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 30000; // 30s 刷新一次托盘提示里的保持时长
@@ -327,6 +335,22 @@ internal sealed class TrayContext : ApplicationContext {
         if (e.Button == MouseButtons.Left) OnToggleOn(sender, e);
     }
 
+    void OnSessionEnding(object sender, SessionEndingEventArgs e) {
+        try {
+            RestoreSystemDefaults();
+            AppLog.Write("会话结束(注销/关机),系统设置已恢复");
+        } catch {
+        }
+    }
+
+    /// <summary>恢复系统默认:撤销唤醒请求 + 撤销电源护栏(退出/注销/关机共用)。</summary>
+    void RestoreSystemDefaults() {
+        miOn.Checked = false;
+        miDisplay.Checked = false;
+        RefreshState(); // 撤销唤醒请求
+        PowerHibernateGuard.Disengage();
+    }
+
     void RefreshState() {
         bool on = miOn.Checked;
         bool display = on && miDisplay.Checked;
@@ -354,10 +378,7 @@ internal sealed class TrayContext : ApplicationContext {
     }
 
     void OnExit(object sender, EventArgs e) {
-        miOn.Checked = false;
-        miDisplay.Checked = false;
-        RefreshState(); // 撤销唤醒请求,恢复系统默认
-        PowerHibernateGuard.Disengage();
+        RestoreSystemDefaults();
         AppLog.Write("退出");
         merger.Dispose();
         timer.Stop();
