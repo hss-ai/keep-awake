@@ -60,12 +60,14 @@ static class AppLog {
     }
 }
 
-// ==== 电源护栏:防待机开启期间临时清零「在此时间后休眠」(HIBERNATEIDLE) ====
+// ==== 电源护栏:防待机开启期间临时清零「在此时间后休眠」的【仅交流侧】 ====
 // 为什么需要:SetThreadExecutionState 挡得住"闲置超时睡眠",挡不住 Win11 新型待机的
 // 「睡眠后休眠 - 固定超时」——2026-10-02 凌晨实测:屏幕熄灭后系统保持活跃约 4 小时,
 // 维护周期进入真睡眠,30 分钟后(机器 HIBERNATEIDLE=0x708)被强制休眠至早晨
 // (事件日志证据:Hibernate from Sleep - Fixed Timeout)。
-// 护栏:开启防待机时把 HIBERNATEIDLE(AC+DC)写 0(从不),原值备份在 HKCU;
+// 为什么只动交流:直流(电池)侧的睡后休眠是合盖/电池场景的保电闸门,动了它出门
+// 一天可能把电耗光(v1.3.0 教训);插电过夜才是防待机的主战场,交流侧归零足够。
+// 护栏:开启防待机时把交流 HIBERNATEIDLE 写 0(从不),原值备份在 HKCU;
 // 关闭/退出恢复;启动时发现未撤销的备份(上次异常退出)先自愈,保证不留残留。
 static class PowerHibernateGuard {
     [DllImport("powrprof.dll", SetLastError = true)]
@@ -119,23 +121,21 @@ static class PowerHibernateGuard {
         if (rc != 0) throw new InvalidOperationException("PowerWrite 失败 rc=" + rc);
     }
 
-    /// <summary>开启防待机时调用:清零 HIBERNATEIDLE(AC+DC),原值备份 HKCU。</summary>
+    /// <summary>开启防待机时调用:仅清零交流侧 HIBERNATEIDLE,原值备份 HKCU。
+    /// 直流(电池)侧刻意不动——合盖/电池场景的「睡后休眠」保电逻辑必须原样保留。</summary>
     public static void Engage() {
         try {
             SelfHealIfPending();                       // 上次异常退出的残留先恢复,再重新护栏
             Guid scheme = ActiveScheme();
             uint ac = ReadVal(true, scheme);
-            uint dc = ReadVal(false, scheme);
             using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) {
                 key.SetValue("HibernateIdleAcBackup", ac, RegistryValueKind.DWord);
-                key.SetValue("HibernateIdleDcBackup", dc, RegistryValueKind.DWord);
                 key.SetValue("GuardPending", 1, RegistryValueKind.DWord);
             }
             if (ac != 0) WriteVal(true, scheme, 0);
-            if (dc != 0) WriteVal(false, scheme, 0);
             Guid s = scheme;
             PowerSetActiveScheme(IntPtr.Zero, ref s);   // 立即生效
-            AppLog.Write("护栏生效:睡眠后休眠 " + ac + "s/" + dc + "s → 从不(原值已备份)");
+            AppLog.Write("护栏生效(仅交流):睡眠后休眠 AC " + ac + "s → 从不;直流不动(合盖/电池照常休眠)");
         } catch (Exception ex) {
             AppLog.Write("护栏 Engage 失败: " + ex.Message);
         }
@@ -171,16 +171,18 @@ static class PowerHibernateGuard {
     }
 
     static void Restore() {
-        uint ac;
-        uint dc;
-        using (var key = Registry.CurrentUser.OpenSubKey(RegPath, true)) {
-            ac = Convert.ToUInt32(key.GetValue("HibernateIdleAcBackup", 0));
-            dc = Convert.ToUInt32(key.GetValue("HibernateIdleDcBackup", 0));
-            key.SetValue("GuardPending", 0, RegistryValueKind.DWord);
-        }
         Guid scheme = ActiveScheme();
-        WriteVal(true, scheme, ac);
-        WriteVal(false, scheme, dc);
+        using (var key = Registry.CurrentUser.OpenSubKey(RegPath, true)) {
+            uint ac = Convert.ToUInt32(key.GetValue("HibernateIdleAcBackup", 0));
+            object dcRaw = key.GetValue("HibernateIdleDcBackup");
+            key.SetValue("GuardPending", 0, RegistryValueKind.DWord);
+            WriteVal(true, scheme, ac);
+            if (dcRaw != null) {
+                // v1.3.0 曾把直流也归零:迁移场景把直流恢复一次并清掉旧键
+                WriteVal(false, scheme, Convert.ToUInt32(dcRaw));
+                key.DeleteValue("HibernateIdleDcBackup");
+            }
+        }
         Guid s = scheme;
         PowerSetActiveScheme(IntPtr.Zero, ref s);
     }
