@@ -14,6 +14,9 @@
 //   - 唤醒请求只挂在本进程(SetThreadExecutionState),退出/被杀/注销系统自动撤销,不改电源计划;
 //   - Mutex 单实例:重复启动直接退出,不多开图标。
 // 注意:C# 5 语法(csc 4.0.30319 不支持 C#6+),不要用字符串插值 $""、?. 等新语法。
+// DPI:app.manifest 声明 dpiAware=true 并由构建脚本 /win32manifest 嵌入(缺了它 exe 裸奔)。
+//   高分屏(本机 175%)上进程若启动时不感知、运行中被 UIA 之类库"中途翻"成 DPI aware,
+//   托盘右键菜单会按 96 DPI 布局直接按物理像素渲染——字体缩成 9pt*(96/168)(v1.3.3 修)。
 
 using System;
 using System.Drawing;
@@ -209,7 +212,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.3.2)");
+        AppLog.Write("启动(v1.3.3)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮

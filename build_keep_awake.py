@@ -34,6 +34,7 @@ SRC_FILES = [
     os.path.join(HERE, "keep_awake_tray.cs"),       # 托盘主程序(防待机 + 菜单)
     os.path.join(HERE, "explorer_tab_merge.cs"),    # 资源管理器单窗口合并(dynamic COM 需 Microsoft.CSharp)
 ]
+MANIFEST = os.path.join(HERE, "app.manifest")       # dpiAware=true:进程从头 system DPI aware
 BUILD_DIR = os.path.join(HERE, "build")
 CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
@@ -101,6 +102,8 @@ def main() -> int:
     for src_file in SRC_FILES:
         if not os.path.isfile(src_file):
             raise SystemExit(f"源码不存在:{src_file}")
+    if not os.path.isfile(MANIFEST):
+        raise SystemExit(f"清单不存在:{MANIFEST}")
     if not os.path.isfile(CSC):
         raise SystemExit(f"未找到系统 csc(这台机器没装 .NET Framework?):{CSC}")
 
@@ -113,7 +116,7 @@ def main() -> int:
 
     compile_cmd = [
         CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
-        "/win32icon:" + ico, "/out:" + out_exe,
+        "/win32icon:" + ico, "/win32manifest:" + MANIFEST, "/out:" + out_exe,
         "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:Microsoft.CSharp.dll",
         "/r:" + find_gac_assembly("UIAutomationClient"),
         "/r:" + find_gac_assembly("UIAutomationTypes"),
