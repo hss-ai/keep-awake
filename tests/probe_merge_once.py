@@ -90,7 +90,7 @@ def main():
     try:
         before = explorer_titles()
         subprocess.Popen(["explorer.exe", probe_dir])
-        time.sleep(4.0)
+        time.sleep(15)  # COM 主路 ~2s;explorer COM/UIA 间歇无响应时,有界重试+键盘兜底实测 8~12s
         after = explorer_titles()
         print("before:", before)
         print("after :", after)

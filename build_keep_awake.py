@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs + explorer_tab_merge.cs → KeepAwake.exe)一键构建
+"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs + explorer_tab_merge.cs + key_remap.cs + shortcut_arrow.cs → KeepAwake.exe)一键构建
 
 流程:
   1) PIL 生成 keep_awake.ico(绿圆底+白咖啡杯,与托盘三态图标同款设计);
@@ -10,8 +10,9 @@
 用法:python build_keep_awake.py                (默认全流程:构建+装机+桌面快捷方式)
       python build_keep_awake.py --build-only  (仅生成图标并编译到 build/KeepAwake.exe,
                                                 CI 用:跳过停旧进程/装机/建快捷方式)
-      (在本仓库根目录跑,两个 .cs 源文件须同目录)
-依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319。
+      (在本仓库根目录跑,三个 .cs 源文件须同目录)
+依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319;
+      装机步骤用系统自带 powershell.exe 与 taskkill,无 pwsh 依赖。
 重复跑 = 重建覆盖(覆盖前自动停掉在跑的旧实例)。
 """
 
@@ -19,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import winreg
 
 # 输出编码防护:非 GBK 环境(如 GitHub Actions runner 的 Python 默认 cp1252)打中文会
@@ -33,6 +35,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_FILES = [
     os.path.join(HERE, "keep_awake_tray.cs"),       # 托盘主程序(防待机 + 菜单)
     os.path.join(HERE, "explorer_tab_merge.cs"),    # 资源管理器单窗口合并(dynamic COM 需 Microsoft.CSharp)
+    os.path.join(HERE, "key_remap.cs"),             # 全局键映射 F2→Ctrl+W(低级键盘钩子)
+    os.path.join(HERE, "shortcut_arrow.cs"),        # 去除快捷方式小箭头(HKLM Shell Icons\29)
 ]
 MANIFEST = os.path.join(HERE, "app.manifest")       # dpiAware=true:进程从头 system DPI aware
 BUILD_DIR = os.path.join(HERE, "build")
@@ -80,7 +84,11 @@ def desktop_dir() -> str:
 
 
 def make_shortcut(exe_path: str, lnk_path: str) -> None:
-    # .lnk 走 WScript.Shell COM,经 pwsh 落地;subprocess 列表参数走 CreateProcessW,中文无损
+    # .lnk 走 WScript.Shell COM,经系统自带 powershell.exe(5.1)落地——不依赖 pwsh;
+    # subprocess 列表参数走 CreateProcessW,中文无损;路径里的 ' 转义成 '' 防 PS 引号断裂
+    def esc(p: str) -> str:
+        return p.replace("'", "''")
+
     cmd = (
         "$sh = New-Object -ComObject WScript.Shell; "
         "$lnk = $sh.CreateShortcut('{lnk}'); "
@@ -89,8 +97,9 @@ def make_shortcut(exe_path: str, lnk_path: str) -> None:
         "$lnk.Description='{desc}'; "
         "$lnk.IconLocation='{exe},0'; "
         "$lnk.Save()"
-    ).format(lnk=lnk_path, exe=exe_path, wdir=os.path.dirname(exe_path), desc="防待机托盘开关(左键开关,右键退出)")
-    result = subprocess.run(["pwsh", "-NoProfile", "-Command", cmd], capture_output=True)
+    ).format(lnk=esc(lnk_path), exe=esc(exe_path), wdir=esc(os.path.dirname(exe_path)),
+             desc=esc("防待机托盘开关(左键开关,右键退出)"))
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True)
     if result.returncode != 0:
         print(result.stdout.decode("gbk", "replace"))
         print(result.stderr.decode("gbk", "replace"))
@@ -137,10 +146,17 @@ def main() -> int:
     dest_dir = os.path.join(os.environ["USERPROFILE"], "Scripts")
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, "KeepAwake.exe")
-    # 若旧实例在跑,先停掉再覆盖
-    subprocess.run(["pwsh", "-NoProfile", "-Command",
-                    "Stop-Process -Name KeepAwake -ErrorAction SilentlyContinue"], capture_output=True)
-    shutil.copyfile(out_exe, dest)
+    # 若旧实例在跑,先停掉再覆盖(taskkill 系统自带,目标不存在时非零退出,忽略;
+    # 进程终止后句柄释放有几拍延迟,拷贝撞锁就等半秒重试)
+    for _ in range(6):
+        subprocess.run(["taskkill", "/IM", "KeepAwake.exe", "/F"], capture_output=True)
+        try:
+            shutil.copyfile(out_exe, dest)
+            break
+        except PermissionError:
+            time.sleep(0.5)
+    else:
+        raise SystemExit("旧实例未能停止,KeepAwake.exe 覆盖失败")
     print(f"[3/4] 已安装:{dest}")
 
     lnk = os.path.join(desktop_dir(), SHORTCUT_NAME)

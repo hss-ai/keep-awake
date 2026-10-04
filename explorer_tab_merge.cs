@@ -6,16 +6,20 @@
 //   1) SetWinEventHook(EVENT_OBJECT_CREATE) 监听新窗口,按类名 CabinetWClass 过滤
 //      (用 CREATE 而非 SHOW:还原最小化窗口不会再触发误合并);
 //   2) 经 Shell COM(IShellWindows/CLSID 9BA05972-...)轮询取新窗口的 LocationURL;
-//      文件系统路径 file:///C:/xx → C:\xx;虚拟文件夹(主页/此电脑)URL 为空;
+//      文件系统路径 file:///C:/xx → C:\xx;虚拟位置(回收站/此电脑)URL 为空,
+//      改读 Document.Folder.Self.Path 得 ::{GUID} 命名空间路径(v1.4.1);
 //      ⚠️ 外部程序唤起的窗口常先落主页再导航,空 URL 是过渡态——须等它稳定 ~3s
 //      且标题不再变化才判虚拟,否则合并标签会停在主页(v1.1.0 已修,日志在 %TEMP%);
-//   3) 若存在另一个资源管理器窗口:置前(AttachThreadInput 解前台锁)→ Ctrl+T 开新标签
-//      → Ctrl+L 聚焦地址栏 → SendInput 逐字符输入路径 → 回车 → 关闭新窗口;
-//      虚拟文件夹场景退化为只开新标签(新标签默认落在主页,与 Win+E 行为一致);
+//   3) 若存在另一个资源管理器窗口(排除仍在待处理队列里的新窗口与其它虚拟桌面
+//      上被 DWM cloak 的窗口):UIA 调用标签栏 AddButton 开真新标签 → 对新增的
+//      空标签原地 Navigate2 到目标路径(实测本机 Win11 的 Navigate2 新标签标志
+//      navOpenInNewTab 无效,见 NavigateNewTab 注释);此路不通时退回键盘注入
+//      (Ctrl+T/Ctrl+L+SendInput)兜底,打字/回车前复查前台,丢了就放弃合并;
 //   4) 若它是第一个资源管理器窗口:保留,它就是"那一个"。
 //
 // 限制:依赖 Win11 22H2+ 资源管理器原生标签页;合并瞬间有按键注入,期间请勿抢键盘。
-// 线程模型:钩子装在 UI 线程(消息循环所在),合并工作在独立 STA 线程(COM 需要)。
+// 线程模型:WinEvent 钩子装在 UI 线程(消息循环所在);合并每窗口一个工作线程
+//   (explorer 的 COM/UIA 会间歇性无响应,独立线程保证一个挂住不堵后续窗口)。
 // 注意:C# 5 语法(系统 csc 不认 C#6+);编译需加 /r:Microsoft.CSharp.dll(dynamic COM)。
 
 using System;
@@ -72,6 +76,8 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")]
     private static extern IntPtr GetFocus();
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int val, int cb);
     [DllImport("imm32.dll")]
     private static extern IntPtr ImmAssociateContext(IntPtr hWnd, IntPtr hIMC);
 
@@ -94,6 +100,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOACTIVATE = 0x0010;
     private const uint SWP_SHOWWINDOW = 0x0040;
+    private const int DWMWA_CLOAKED = 13;   // >0 表示窗口被 DWM 隐藏(典型:在其它虚拟桌面上)
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -129,9 +136,12 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private readonly Thread worker;
     private readonly AutoResetEvent wakeup = new AutoResetEvent(false);
     private readonly Queue<IntPtr> pending = new Queue<IntPtr>();
+    private readonly HashSet<IntPtr> inFlight = new HashSet<IntPtr>();   // 正在合并中的窗口
     private readonly Dictionary<IntPtr, DateTime> seen = new Dictionary<IntPtr, DateTime>();
     private volatile bool enabled;
     private bool disposed;
+    // 键盘注入互斥门:多个合并线程同时进键盘兜底会互相打乱对方的按键序列
+    private static readonly object KeyboardGate = new object();
 
     public ExplorerTabMerger() {
         hookProc = OnWinEvent;
@@ -185,11 +195,24 @@ internal sealed class ExplorerTabMerger : IDisposable {
                     if (pending.Count == 0) break;
                     hwnd = pending.Dequeue();
                 }
-                try {
-                    if (enabled) HandleNewWindow(hwnd);
-                } catch {
-                    // 单个窗口处理异常不拖垮守护
-                }
+                // 每个窗口的合并跑在独立线程:explorer 的 COM/UIA 都会间歇性无响应,
+                // 单线程串行时一个调用挂住就堵死整条队列(2026-10-04 实测挂过 3 分钟);
+                // 独立线程顶多这一个窗口不合并,后续窗口照常
+                lock (inFlight) { inFlight.Add(hwnd); }
+                Thread job = new Thread(delegate() {
+                    try {
+                        if (enabled) HandleNewWindow(hwnd);
+                    } catch {
+                        // 单个窗口处理异常不拖垮守护
+                    } finally {
+                        lock (inFlight) { inFlight.Remove(hwnd); }
+                    }
+                });
+                job.IsBackground = true;
+                job.Name = "ExplorerMergeJob";
+                job.SetApartmentState(ApartmentState.STA);   // 原设计:Shell COM 走 STA 稳(老 worker 就是 STA)
+                job.Start();
+                Thread.Sleep(250);   // 轻微错峰:连开多窗时别让后到的被前一个抢先选为目标
             }
         }
     }
@@ -219,17 +242,24 @@ internal sealed class ExplorerTabMerger : IDisposable {
             string title = GetTitle(newHwnd);
             if (lastTitle != null && title != lastTitle) emptyRun = 0;   // 还在导航
             lastTitle = title;
-            string probe = GetExplorerLocation(newHwnd);
+            string probe = ComCall(1500, delegate() { return GetExplorerLocation(newHwnd); }, null);
             if (probe != null && probe.Length > 0) { path = probe; break; }
             if (probe != null && IsWindowVisible(newHwnd)) emptyRun++;
-            if (emptyRun >= 15) { path = ""; break; }        // ~3s 稳定空 URL → 虚拟文件夹
+            if (emptyRun >= 15) {                            // ~3s 稳定空 URL → 虚拟位置
+                // 虚拟位置(回收站/此电脑等)LocationURL 为空,但 Document.Folder.Self.Path
+                // 能拿到 ::{GUID}(2026-10-04 本机实测)——用它导航,新标签落在用户真想去的
+                // 位置;读不到才退回主页标签(与 Win+E 默认落点一致)
+                string shellPath = ComCall(3000, delegate() { return GetExplorerShellPath(newHwnd); }, null);
+                path = (shellPath != null && shellPath.StartsWith("::")) ? shellPath : "";
+                break;
+            }
             Thread.Sleep(200);
         }
         if (path == null) {
             Log("等待 " + (poll * 200 / 1000.0) + "s 未见导航信息,跳过合并(窗口保留)");
             return;
         }
-        Log("路径判定[" + poll + "轮]: " + (path.Length == 0 ? "(虚拟文件夹→主页标签)" : path));
+        Log("路径判定[" + poll + "轮]: " + (path.Length == 0 ? "(虚拟位置不可解析→主页标签)" : path));
 
         IntPtr target = FindTargetWindow(newHwnd);
         if (target == IntPtr.Zero) { Log("无既有窗口,保留为首窗"); return; }
@@ -247,39 +277,59 @@ internal sealed class ExplorerTabMerger : IDisposable {
             }
         }
 
-        if (!merged && path.Length > 0) {
-            // 兜底:键盘注入(前台确认→Ctrl+T→Ctrl+L 输入路径;IME 摘除+重试+剪贴板粘贴)
-            if (BringToFrontVerified(target)) {
-                SendCtrlCombo(VK_T);
-                Thread.Sleep(400);
-                NavigateTarget(target, path);
-                Thread.Sleep(500);
-                if (!TabExistsInWindow(target, path)) {
-                    Log("键盘首轮未见目标标签(当前标签: " + TabsSnapshot(target) + "),重试一次");
+        if (!merged && path.Length > 0 && !path.StartsWith("::")) {
+            // 兜底:键盘注入(前台确认→Ctrl+T→Ctrl+L 输入路径;IME 摘除+重试+剪贴板粘贴)。
+            // 虚拟位置(::{GUID})不走键盘:实测打 GUID 进地址栏不生效,还会给目标窗口
+            // 堆一堆默认标签;COM 的 Navigate2 在本进程内又会间歇性无限挂起(2026-10-04,
+            // pwsh 里同调用正常,疑 C# dynamic/套间交互,待挂起线程抓栈定位)——
+            // GUID 合并只赌 COM 一把,失败保窗不丢位置(v1.4.0 一刀切主页的严格改进)。
+            // 整段过 KeyboardGate:两个合并线程同时打字会互相打断对方的按键序列
+            bool gate = Monitor.TryEnter(KeyboardGate, 5000);
+            try {
+                if (!gate) {
+                    Log("键盘兜底:互斥门等待超时(另一合并正在注入),放弃");
+                } else if (BringToFrontVerified(target)) {
+                    SendCtrlCombo(VK_T);
+                    Thread.Sleep(400);
                     NavigateTarget(target, path);
                     Thread.Sleep(500);
-                }
-                if (!TabExistsInWindow(target, path)) {
-                    Log("重试仍未到位(当前标签: " + TabsSnapshot(target) + "),改用剪贴板粘贴兜底");
-                    NavigateByClipboard(target, path);
-                    Thread.Sleep(600);
-                }
+                    if (!TabExistsInWindow(target, path)) {
+                        Log("键盘首轮未见目标标签(当前标签: " + TabsSnapshot(target) + "),重试一次");
+                        NavigateTarget(target, path);
+                        Thread.Sleep(500);
+                    }
+                    if (!TabExistsInWindow(target, path)) {
+                        Log("重试仍未到位(当前标签: " + TabsSnapshot(target) + "),改用剪贴板粘贴兜底");
+                        NavigateByClipboard(target, path);
+                        Thread.Sleep(600);
+                    }
                 merged = TabExistsInWindow(target, path);
                 Log("键盘兜底导航验证: " + (merged ? "OK" : "仍失败"));
-            } else {
-                Log("无法把目标窗口置前,跳过键盘兜底");
+                } else {
+                    Log("无法把目标窗口置前,跳过键盘兜底");
+                }
+            } finally {
+                if (gate) Monitor.Exit(KeyboardGate);
             }
         }
 
         if (!merged && path.Length == 0) {
-            // 虚拟文件夹(主页等):Ctrl+T 新标签默认就落在主页,与被并窗口一致
-            if (BringToFrontVerified(target)) {
-                SendCtrlCombo(VK_T);
-                Thread.Sleep(400);
-                merged = true;
-                Log("虚拟文件夹:已开主页标签");
-            } else {
-                Log("虚拟文件夹但无法置前,放弃");
+            // 虚拟位置读不到命名空间路径:Ctrl+T 新标签默认就落在主页,与被并窗口一致。
+            // 同样要注入按键,过 KeyboardGate
+            bool gate = Monitor.TryEnter(KeyboardGate, 5000);
+            try {
+                if (!gate) {
+                    Log("主页标签:键盘互斥门等待超时,放弃");
+                } else if (BringToFrontVerified(target)) {
+                    SendCtrlCombo(VK_T);
+                    Thread.Sleep(400);
+                    merged = true;
+                    Log("虚拟文件夹:已开主页标签");
+                } else {
+                    Log("虚拟文件夹但无法置前,放弃");
+                }
+            } finally {
+                if (gate) Monitor.Exit(KeyboardGate);
             }
         }
 
@@ -333,28 +383,60 @@ internal sealed class ExplorerTabMerger : IDisposable {
     /// 可靠组合:UIA 调用标签栏 AddButton 开出真新标签(落在主页,LocationURL 为空),
     /// 再对这条新增的空标签原地 Navigate2 到目标路径。全程零键盘:不吃输入法、不依赖前台。</summary>
     private static bool NavigateNewTab(IntPtr targetHwnd, string path) {
-        int emptyBefore = CountEmptyTabs(targetHwnd);
-        try {
-            var root = System.Windows.Automation.AutomationElement.FromHandle(targetHwnd);
-            var cond = new System.Windows.Automation.PropertyCondition(
-                System.Windows.Automation.AutomationElement.AutomationIdProperty, "AddButton");
-            var btn = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, cond);
-            if (btn == null) {
-                Log("未找到标签栏 AddButton(Win10 无标签页?)");
-                return false;
-            }
-            var inv = (System.Windows.Automation.InvokePattern)btn.GetCurrentPattern(
-                System.Windows.Automation.InvokePattern.Pattern);
-            inv.Invoke();
-        } catch (Exception ex) {
-            Log("UIA 新标签失败: " + ex.Message);
+        int emptyBefore = ComCall(2000, delegate() { return CountEmptyTabs(targetHwnd); }, -1);
+        if (emptyBefore < 0) {
+            Log("COM 无响应(空标签基线计数超时),放弃 COM 新标签");
             return false;
         }
-        // 等新增的空标签出现(空标签计数恰好 +1 才动手,防止误导航用户自己的主页标签)
+        // AddButton 的 UIA 查找/调用会间歇性失败,两种形态(2026-10-03/04 实测,v1.3.3 起就有):
+        //   轻症=FindFirst 返回 null;重症=explorer 的 UIA provider 无响应时 FindFirst 无限挂起
+        //   (实测挂过 ~3 分钟)。挪到独立线程 + Join 超时兜底,重试 3 次再判死;
+        //   超时后线程弃置(后台线程,极端情况泄漏一个,好过合并线程陪葬)
+        bool invoked = false;
+        for (int attempt = 1; attempt <= 3 && !invoked; attempt++) {
+            Exception uiaErr = null;
+            Thread uia = new Thread(delegate() {
+                try {
+                    var root = System.Windows.Automation.AutomationElement.FromHandle(targetHwnd);
+                    var cond = new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.AutomationIdProperty, "AddButton");
+                    var btn = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, cond);
+                    if (btn == null) return;                     // 找不到:线程正常结束,invoked 仍 false
+                    var inv = (System.Windows.Automation.InvokePattern)btn.GetCurrentPattern(
+                        System.Windows.Automation.InvokePattern.Pattern);
+                    inv.Invoke();
+                    invoked = true;
+                } catch (Exception ex) {
+                    uiaErr = ex;
+                }
+            });
+            uia.IsBackground = true;
+            uia.Start();
+            if (!uia.Join(4000)) {
+                Log("UIA AddButton 查找/调用超时(第 " + attempt + " 次)——explorer UIA 无响应");
+            } else if (uiaErr != null) {
+                Log("UIA 新标签异常(第 " + attempt + " 次): " + uiaErr.Message);
+            } else if (!invoked) {
+                Log("未找到标签栏 AddButton(第 " + attempt + " 次;Win10 无标签页或 UIA 未就绪)");
+            }
+            if (!invoked) Thread.Sleep(300);
+        }
+        if (!invoked) {
+            Log("AddButton 3 次尝试均失败,放弃 COM 新标签");
+            return false;
+        }
+        // 等新增的空标签出现(空标签计数至少 +1 才动手;超时线程迟到完成时可能多点出
+        // 两个,>= 都放行,NavigateEmptyTab 取最后一条空标签即最新点出的那个)。
+        // 计数每次都限时——COM 挂起时立即按未见处理,不再无限等
         for (int i = 0; i < 12; i++) {
             Thread.Sleep(150);
-            if (CountEmptyTabs(targetHwnd) == emptyBefore + 1) {
-                return NavigateEmptyTab(targetHwnd, path);
+            int nowEmpty = ComCall(1500, delegate() { return CountEmptyTabs(targetHwnd); }, -1);
+            if (nowEmpty < 0) {
+                Log("COM 无响应(空标签复点超时),放弃 COM 新标签");
+                return false;
+            }
+            if (nowEmpty >= emptyBefore + 1) {
+                return ComCall(5000, delegate() { return NavigateEmptyTab(targetHwnd, path); }, false);
             }
         }
         Log("AddButton 调用后未见新增空标签");
@@ -385,34 +467,61 @@ internal sealed class ExplorerTabMerger : IDisposable {
         return n;
     }
 
-    /// <summary>把目标窗口下一条空 URL 标签原地导航到 path(只应在"刚新增了空标签"后调用)。</summary>
+    /// <summary>把目标窗口下【最后一条】空 URL 标签原地导航到 path(只应在"刚新增了空标签"
+    /// 后调用)。用"最后"而非"第一":ShellWindows 按注册顺序枚举,UIA 刚点出来的空标签
+    /// 排在后;若用户自己原本开着主页标签,取第一个会把用户的主页标签导航走,
+    /// 新空标签反而留在主页。</summary>
     private static bool NavigateEmptyTab(IntPtr targetHwnd, string path) {
         try {
             Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
             dynamic shellWindows = Activator.CreateInstance(t);
+            dynamic last = null;
             try {
                 foreach (dynamic w in shellWindows) {
+                    bool keep = false;
                     try {
-                        if (new IntPtr(Convert.ToInt64(w.HWND)) != targetHwnd) continue;
-                        if (!string.IsNullOrEmpty((string)w.LocationURL)) continue;
-                        w.Navigate2(path, 0);        // 原地导航这条新开的主页标签
-                        return true;
+                        keep = new IntPtr(Convert.ToInt64(w.HWND)) == targetHwnd
+                            && string.IsNullOrEmpty((string)w.LocationURL);
                     } catch {
-                    } finally {
+                    }
+                    if (keep) {
+                        if (last != null) { try { Marshal.ReleaseComObject(last); } catch { } }
+                        last = w;
+                    } else {
                         try { Marshal.ReleaseComObject(w); } catch { }
                     }
+                }
+                if (last == null) {
+                    Log("NavigateEmptyTab: 枚举未见空标签(目标=" + targetHwnd + ")");
+                    return false;
+                }
+                try {
+                    // 实测(2026-10-04 隔离探针):Navigate2 对裸 "::{GUID}" 抛
+                    // "Value does not fall within the expected range",加 shell::: 前缀即可;
+                    // 文件系统路径原样传
+                    string navPath = path.StartsWith("::") ? "shell:::" + path : path;
+                    long t0 = DateTime.Now.Ticks;
+                    last.Navigate2(navPath, 0);        // 原地导航这条新开的主页标签
+                    Log("NavigateEmptyTab: Navigate2 OK " + ((DateTime.Now.Ticks - t0) / 10000) + "ms → " + navPath);
+                    return true;
+                } catch (Exception ex) {
+                    Log("NavigateEmptyTab: Navigate2 异常: " + ex.Message + " (path=" + path + ")");
+                    return false;
+                } finally {
+                    try { Marshal.ReleaseComObject(last); } catch { }
                 }
             } finally {
                 try { Marshal.ReleaseComObject(shellWindows); } catch { }
             }
-        } catch {
+        } catch (Exception ex) {
+            Log("NavigateEmptyTab: 枚举阶段异常: " + ex.Message);
         }
         return false;
     }
 
     /// <summary>在目标窗口当前标签导航到 path:Ctrl+L 聚焦地址栏,打字期间临时摘掉
     /// 该编辑框的输入法上下文(否则中文输入法会吞掉 unicode 按键、回车变成确认候选词),
-    /// 输入路径回车后恢复。</summary>
+    /// 输入路径回车后恢复。打字前与回车前各复查一次前台。</summary>
     private static void NavigateTarget(IntPtr targetHwnd, string path) {
         SendCtrlCombo(VK_L);
         Thread.Sleep(160);
@@ -431,8 +540,16 @@ internal sealed class ExplorerTabMerger : IDisposable {
             }
             if (!attached || focus == IntPtr.Zero)
                 Log("注意: 附线=" + attached + " 焦点=" + focus + "(IME 摘除未生效,输入可能被输入法吃掉)");
+            if (!StillForeground(targetHwnd)) {
+                Log("键盘兜底:打字前前台已丢失,中止(新窗口保留)");
+                return;
+            }
             TypeUnicode(path);
             Thread.Sleep(80);
+            if (!StillForeground(targetHwnd)) {
+                Log("键盘兜底:回车前前台已丢失,中止(新窗口保留)");
+                return;
+            }
             KeyTap(VK_RETURN);
             Thread.Sleep(120);                               // 让导航吃到回车再恢复输入法
         } finally {
@@ -442,11 +559,19 @@ internal sealed class ExplorerTabMerger : IDisposable {
     }
 
     /// <summary>兜底导航:Ctrl+L 后粘贴路径再回车。粘贴不走键盘注入,天然绕过输入法;
-    /// 代价是短暂占用剪贴板(仅文本,用完尽力恢复)。</summary>
+    /// 代价是短暂占用剪贴板——剪贴板里有图片/文件等非文本内容时不动它(恢复不了就毁了),
+    /// 直接放弃本兜底;文本则用完尽力恢复。粘贴前与回车前各复查一次前台。</summary>
     private static void NavigateByClipboard(IntPtr targetHwnd, string path) {
         string prev = null;
         try {
-            if (System.Windows.Forms.Clipboard.ContainsText()) prev = System.Windows.Forms.Clipboard.GetText();
+            if (System.Windows.Forms.Clipboard.ContainsText()) {
+                prev = System.Windows.Forms.Clipboard.GetText();
+            } else if (System.Windows.Forms.Clipboard.ContainsImage()
+                    || System.Windows.Forms.Clipboard.ContainsFileDropList()
+                    || System.Windows.Forms.Clipboard.ContainsAudio()) {
+                Log("剪贴板里有非文本内容(图片/文件),不占用,兜底放弃");
+                return;
+            }
         } catch {
         }
         try {
@@ -458,8 +583,16 @@ internal sealed class ExplorerTabMerger : IDisposable {
         try {
             SendCtrlCombo(VK_L);
             Thread.Sleep(160);
+            if (!StillForeground(targetHwnd)) {
+                Log("剪贴板兜底:粘贴前前台已丢失,中止(新窗口保留)");
+                return;
+            }
             SendCtrlCombo(VK_V);                             // 'V'
             Thread.Sleep(120);
+            if (!StillForeground(targetHwnd)) {
+                Log("剪贴板兜底:回车前前台已丢失,中止(新窗口保留)");
+                return;
+            }
             KeyTap(VK_RETURN);
             Thread.Sleep(200);
         } finally {
@@ -470,14 +603,15 @@ internal sealed class ExplorerTabMerger : IDisposable {
         }
     }
 
-    /// <summary>目标窗口名下(同 HWND 的每个标签各有一条 Shell 记录)是否已有位于 path 的标签。</summary>
+    /// <summary>目标窗口名下(同 HWND 的每个标签各有一条 Shell 记录)是否已有位于 path 的标签。
+    /// COM 限时:超时按不存在处理。</summary>
     private static bool TabExistsInWindow(IntPtr hwnd, string path) {
-        return TabsSnapshotOf(hwnd, path, true).Length > 0;
+        return ComCall(2000, delegate() { return TabsSnapshotOf(hwnd, path, true).Length > 0; }, false);
     }
 
-    /// <summary>诊断用:列出目标窗口当前全部标签的路径("; " 分隔)。</summary>
+    /// <summary>诊断用:列出目标窗口当前全部标签的路径("; " 分隔)。COM 限时。</summary>
     private static string TabsSnapshot(IntPtr hwnd) {
-        return TabsSnapshotOf(hwnd, null, false);
+        return ComCall(2000, delegate() { return TabsSnapshotOf(hwnd, null, false); }, "(COM超时)");
     }
 
     /// <summary>一次枚举两用:path 为 null 返回全部标签快照串;否则命中同路径标签时返回该路径。</summary>
@@ -490,7 +624,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 foreach (dynamic w in shellWindows) {
                     try {
                         if (new IntPtr(Convert.ToInt64(w.HWND)) != hwnd) continue;
-                        string p = UrlToPath((string)w.LocationURL);
+                        string p = TabComparePath(w);      // 虚拟标签用 ::{GUID} 参与比对
                         if (matchOnly) {
                             if (string.Equals(p, path, StringComparison.OrdinalIgnoreCase)) return p;
                         } else {
@@ -544,18 +678,75 @@ internal sealed class ExplorerTabMerger : IDisposable {
         return url;                                         // 非 file 协议原样返回
     }
 
-    private static IntPtr FindTargetWindow(IntPtr exclude) {
+    /// <summary>取某资源管理器窗口当前标签的 Shell 命名空间路径。虚拟位置(回收站/此电脑)
+    /// LocationURL 为空,但这里能拿到 ::{GUID} 形式。null=窗口尚未登记;""=登记了但读不到。</summary>
+    private static string GetExplorerShellPath(IntPtr hwnd) {
+        try {
+            Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+            dynamic shellWindows = Activator.CreateInstance(t);
+            try {
+                foreach (dynamic w in shellWindows) {
+                    bool mine = false;
+                    string p = null;
+                    try {
+                        mine = new IntPtr(Convert.ToInt64(w.HWND)) == hwnd;
+                        if (mine) p = w.Document.Folder.Self.Path;
+                    } catch {
+                    } finally {
+                        try { Marshal.ReleaseComObject(w); } catch { }
+                    }
+                    if (mine) return p == null ? "" : p;
+                }
+            } finally {
+                try { Marshal.ReleaseComObject(shellWindows); } catch { }
+            }
+        } catch {
+        }
+        return null;
+    }
+
+    /// <summary>某标签的参与比对路径:文件系统标签用 LocationURL;空 URL(虚拟标签)
+    /// 退读 Self.Path(::{GUID}),让 TabExistsInWindow 也能验证虚拟位置。</summary>
+    private static string TabComparePath(dynamic w) {
+        string p = UrlToPath((string)w.LocationURL);
+        if (p.Length == 0) {
+            try {
+                p = w.Document.Folder.Self.Path;
+                if (p == null) p = "";
+            } catch {
+                p = "";
+            }
+        }
+        return p;
+    }
+
+    private IntPtr FindTargetWindow(IntPtr exclude) {
+        // 排除仍在待处理队列/正在合并中的窗口:登录还原/快速连开时,A 若并进排队中的 B,
+        // B 随后又被当新窗口合并关掉,B 里 A 的标签就一起没了
+        List<IntPtr> skip = new List<IntPtr>();
+        skip.Add(exclude);
+        lock (pending) { foreach (IntPtr h in pending) skip.Add(h); }
+        lock (inFlight) { foreach (IntPtr h in inFlight) skip.Add(h); }
         IntPtr best = IntPtr.Zero;
         EnumWindows(delegate(IntPtr h, IntPtr l) {
             var sb = new StringBuilder(64);
             if (GetClassName(h, sb, 64) != 0 && sb.ToString() == ExplorerWindowClass
-                && IsWindowVisible(h) && h != exclude) {
+                && !skip.Contains(h) && IsMergeTargetVisible(h)) {
                 best = h;
                 return false;                              // EnumWindows 按 z 序先见顶层,取最上面的那个
             }
             return true;
         }, IntPtr.Zero);
         return best;
+    }
+
+    /// <summary>可见且不在别的虚拟桌面——IsWindowVisible 对其它桌面的窗口也返回 true
+    /// (DWM 只是把它 cloak 掉),不滤的话标签会并进一个当前桌面看不见的窗口。</summary>
+    private static bool IsMergeTargetVisible(IntPtr h) {
+        if (!IsWindowVisible(h)) return false;
+        int cloaked;
+        if (DwmGetWindowAttribute(h, DWMWA_CLOAKED, out cloaked, 4) == 0 && cloaked != 0) return false;
+        return true;
     }
 
     private void PruneSeen() {
@@ -572,6 +763,27 @@ internal sealed class ExplorerTabMerger : IDisposable {
     }
 
     // ==== 输入注入 ====
+
+    /// <summary>限时跑一段 Shell COM 操作。explorer 的 COM 通道会间歇性无响应,同步调用
+    /// 可能无限挂起(2026-10-04 实测 CountEmptyTabs/枚举都挂过,且挂时无任何征兆)——
+    /// 合并路径上的 COM 调用一律经此包装:超时返回 fallback(调用方按失败处理,窗口保留),
+    /// 被弃置的后台线程随进程终结。UIA 同理见 NavigateNewTab 的线程+Join 包装。</summary>
+    private static T ComCall<T>(int timeoutMs, System.Func<T> fn, T fallback) {
+        T result = fallback;
+        Thread t = new Thread(delegate() {
+            try { result = fn(); } catch { }
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);   // Shell COM 走 STA 稳(与合并线程同语义)
+        t.Start();
+        return t.Join(timeoutMs) ? result : fallback;
+    }
+
+    /// <summary>键盘注入前的前台复查:置前验证与打字之间隔着几百毫秒,用户此刻切走
+    /// 窗口的话,后续按键会整段打进别的程序——丢了就放弃,宁可不合并。</summary>
+    private static bool StillForeground(IntPtr hwnd) {
+        return GetForegroundWindow() == hwnd;
+    }
 
     private static INPUT KeyDown(ushort vk, ushort scan, uint flags) {
         INPUT i = new INPUT();
