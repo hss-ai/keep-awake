@@ -11,8 +11,9 @@
 //      ⚠️ 外部程序唤起的窗口常先落主页再导航,空 URL 是过渡态——须等它稳定 ~3s
 //      且标题不再变化才判虚拟,否则合并标签会停在主页(v1.1.0 已修,日志在 %TEMP%);
 //   3) 若存在另一个资源管理器窗口(排除仍在待处理队列里的新窗口与其它虚拟桌面
-//      上被 DWM cloak 的窗口):UIA 调用标签栏 AddButton 开真新标签 → 对新增的
-//      空标签原地 Navigate2 到目标路径(实测本机 Win11 的 Navigate2 新标签标志
+//      上被 DWM cloak 的窗口):目标路径已是既有窗口里的某条标签时,UIA 直接激活
+//      那条标签(免开重复标签,v1.4.2);否则 UIA 调用标签栏 AddButton 开真新标签 →
+//      对新增的空标签原地 Navigate2 到目标路径(实测本机 Win11 的 Navigate2 新标签标志
 //      navOpenInNewTab 无效,见 NavigateNewTab 注释);此路不通时退回键盘注入
 //      (Ctrl+T/Ctrl+L+SendInput)兜底,打字/回车前复查前台,丢了就放弃合并;
 //   4) 若它是第一个资源管理器窗口:保留,它就是"那一个"。
@@ -266,7 +267,13 @@ internal sealed class ExplorerTabMerger : IDisposable {
         Log("合并前标签快照: " + TabsSnapshot(target));
 
         bool merged = false;
-        if (path.Length > 0) {
+        if (path.Length > 0 && ActivateExistingTab(target, path, newHwnd)) {
+            // 目标路径已是既有窗口里的某条标签:直接激活它,不再开重复标签
+            //(v1.4.2 之前这里无判断,目录已在隐藏标签里时照样开出第二条重复标签,
+            // 活动的还是新开的重复条,用户要找的那条老标签永远切不过去)
+            merged = true;
+        }
+        if (!merged && path.Length > 0) {
             // 首选:Shell COM Navigate2(navOpenInNewTab)——零按键:不经前台、不吃输入法、不抢焦点
             if (NavigateNewTab(target, path)) {
                 for (int i = 0; i < 10 && !TabExistsInWindow(target, path); i++) Thread.Sleep(200);
@@ -517,6 +524,112 @@ internal sealed class ExplorerTabMerger : IDisposable {
             Log("NavigateEmptyTab: 枚举阶段异常: " + ex.Message);
         }
         return false;
+    }
+
+    /// <summary>目标窗口名下已有位于 path 的标签时,激活那条标签(UIA SelectionItem.Select),
+    /// 免开重复标签。索引映射:Shell 枚举同 HWND 记录序 == UIA TabListView 子项序
+    /// (2026-10-07 探针实测一一对应,TabItem 的 Name 是本地化显示名无法按路径匹配,
+    /// 只能靠索引);UIA 走独立线程+Join 超时(与 AddButton 同源的挂死风险);激活以
+    /// 「目标窗口标题变为新窗口的显示名」核实(新窗口此刻已导航到目标,标题即显示名,
+    /// 虚拟位置同样成立)。失败返回 false,落回「新开标签」的既有路径,行为不劣化。</summary>
+    private static bool ActivateExistingTab(IntPtr target, string path, IntPtr newHwnd) {
+        int idx = ComCall(2000, delegate() { return TabIndexOf(target, path); }, -1);
+        if (idx < 0) return false;                       // 无同路径标签:该走新开标签
+        string display = GetTitle(newHwnd);
+        int dash = display.IndexOf(" - 文件资源管理器");
+        if (dash > 0) display = display.Substring(0, dash);
+        if (display.Length == 0) return false;
+        bool selected = false;
+        for (int attempt = 1; attempt <= 2 && !selected; attempt++) {
+            selected = UiaSelectTab(target, idx);
+            if (!selected) Thread.Sleep(200);
+        }
+        if (!selected) {
+            Log("既有标签激活: UIA Select 失败(tab#" + idx + "),转新开标签");
+            return false;
+        }
+        for (int i = 0; i < 10; i++) {                   // 标题核实,~2s
+            string t = GetTitle(target);
+            if (t == display || t.StartsWith(display + " 和 ") || t.StartsWith(display + " - ")) {
+                Log("既有标签激活: OK(tab#" + idx + " → " + path + ")");
+                return true;
+            }
+            Thread.Sleep(200);
+        }
+        Log("既有标签激活: Select 已调用但标题未切换(当前: " + GetTitle(target) + "),转新开标签");
+        return false;
+    }
+
+    /// <summary>hwnd 名下 tab 序列中,比对路径 == path 的第一条的索引(0-based);无则 -1。
+    /// 提速关键:文件系统路径只比 LocationURL(便宜)——空 URL 标签(主页等)读
+    /// Document.Folder.Self.Path 是跨进程慢调用(实测能把整个枚举拖到超时),仅当目标
+    /// 本身是虚拟路径(::{GUID})才对空 URL 标签做那次慢读。</summary>
+    private static int TabIndexOf(IntPtr hwnd, string path) {
+        bool virtualPath = path.StartsWith("::");
+        int idx = -1;
+        int i = 0;
+        try {
+            Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+            dynamic shellWindows = Activator.CreateInstance(t);
+            try {
+                foreach (dynamic w in shellWindows) {
+                    bool mine = false;
+                    bool hit = false;
+                    try {
+                        mine = new IntPtr(Convert.ToInt64(w.HWND)) == hwnd;
+                        if (mine) {
+                            string cmp = UrlToPath((string)w.LocationURL);
+                            if (cmp.Length == 0 && virtualPath) cmp = TabComparePath(w);
+                            hit = string.Equals(cmp, path, StringComparison.OrdinalIgnoreCase);
+                        }
+                    } catch {
+                    } finally {
+                        try { Marshal.ReleaseComObject(w); } catch { }
+                    }
+                    if (!mine) continue;
+                    if (hit && idx < 0) idx = i;
+                    i++;
+                }
+            } finally {
+                try { Marshal.ReleaseComObject(shellWindows); } catch { }
+            }
+        } catch {
+        }
+        return idx;
+    }
+
+    /// <summary>UIA 激活 TabListView 第 idx 个子项(独立线程限时;返回成功与否,不抛)。
+    /// tab 项不是标准 TabItem 挂在窗口树下能 FindAll 到的——须先找 AutomationId=
+    /// "TabListView" 的列表,再经 ControlViewWalker 逐个走子项(2026-10-07 探针实测)。</summary>
+    private static bool UiaSelectTab(IntPtr hwnd, int idx) {
+        bool ok = false;
+        Thread uia = new Thread(delegate() {
+            try {
+                var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+                var cond = new System.Windows.Automation.PropertyCondition(
+                    System.Windows.Automation.AutomationElement.AutomationIdProperty, "TabListView");
+                var list = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, cond);
+                if (list == null) return;
+                var walker = System.Windows.Automation.TreeWalker.ControlViewWalker;
+                var child = walker.GetFirstChild(list);
+                int i = 0;
+                System.Windows.Automation.AutomationElement item = null;
+                while (child != null) {
+                    if (i == idx) { item = child; break; }
+                    child = walker.GetNextSibling(child);
+                    i++;
+                }
+                if (item == null) return;
+                var sel = (System.Windows.Automation.SelectionItemPattern)item.GetCurrentPattern(
+                    System.Windows.Automation.SelectionItemPattern.Pattern);
+                sel.Select();
+                ok = true;
+            } catch {
+            }
+        });
+        uia.IsBackground = true;
+        uia.Start();
+        return uia.Join(4000) && ok;
     }
 
     /// <summary>在目标窗口当前标签导航到 path:Ctrl+L 聚焦地址栏,打字期间临时摘掉

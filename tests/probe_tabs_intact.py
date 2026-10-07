@@ -61,9 +61,18 @@ def total_tabs():
 
 
 def quit_test_tabs():
-    cmd = ("foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { "
-           "try { if ([string]$w.LocationURL -like '*" + MARKER + "*') { $w.Quit() } } catch {} }")
-    subprocess.run(["pwsh", "-NoProfile", "-Command", cmd], capture_output=True)
+    """逐条重枚举 Quit 测试标签:foreach 同一集合内连 Quit 会因 COM 集合塌缩错位
+    漏关/误伤(实测),每次只关第一条匹配再重新枚举,轮次上限兜底。"""
+    for _ in range(12):
+        cmd = ("$victim = $null; "
+               "foreach ($w in (New-Object -ComObject Shell.Application).Windows()) { "
+               "try { if ([string]$w.LocationURL -like '*" + MARKER + "*') { $victim = $w; break } } catch {} }; "
+               "if ($victim) { try { $victim.Quit(); 'one' } catch { 'err' } } else { 'none' }")
+        r = subprocess.run(["pwsh", "-NoProfile", "-Command", cmd],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if "one" not in r.stdout:
+            break
+        time.sleep(0.6)
 
 
 def pwsh(cmd):
@@ -91,7 +100,9 @@ def main():
         expect_wins = max(n0, 1)
         for idx, d in enumerate(dirs):
             subprocess.Popen(["explorer.exe", d])
-            time.sleep(3.8)
+            # 8s:COM/UIA 主路正常 ~2s;explorer 忙态(UIA 间歇无响应)时 AddButton 有界
+            # 重试实测 8~12s——3.8s 的旧预算在忙态下必然数在新窗口关掉之前,假 FAIL
+            time.sleep(8.0)
             wins = len(explorer_hwnds())
             tabs = total_tabs()
             print("step %d: windows=%d tabs=%d(期望 %d/%d)" % (idx, wins, tabs, expect_wins, base + idx + 1))
