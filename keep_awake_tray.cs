@@ -11,8 +11,8 @@
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
 //     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11) /
-//     键映射▸✔F2→Ctrl+W ✔Win(左)→Ctrl(左)(低级键盘钩子,接替 PowerToys
-//       Keyboard Manager;两条映射各自独立开关,v1.4.3 起) /
+//     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
+//       Keyboard Manager;两条映射各自独立开关,左 Win 保留原义) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
 //       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) / 退出;
@@ -238,7 +238,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miExplorer;
     readonly ToolStripMenuItem miKeymap;    // 键映射(父项):映射多了,收进二级菜单
     readonly ToolStripMenuItem miKeymapF2;  // └ F2 → Ctrl+W
-    readonly ToolStripMenuItem miKeymapWin; // └ Win(左) → Ctrl(左)
+    readonly ToolStripMenuItem miKeymapWin; // └ Win(右) → Ctrl(右)
     readonly ToolStripMenuItem miAutoStart;
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
@@ -251,7 +251,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.3)");
+        AppLog.Write("启动(v1.4.4)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -268,7 +268,7 @@ internal sealed class TrayContext : ApplicationContext {
         miExplorer.Click += OnToggleExplorer;
         miKeymapF2 = new ToolStripMenuItem("F2 → Ctrl+W");
         miKeymapF2.Click += OnToggleKeymapF2;
-        miKeymapWin = new ToolStripMenuItem("Win(左) → Ctrl(左)");
+        miKeymapWin = new ToolStripMenuItem("Win(右) → Ctrl(右)");
         miKeymapWin.Click += OnToggleKeymapWin;
         miKeymap = new ToolStripMenuItem("键映射");
         miKeymap.DropDownItems.Add(miKeymapF2);
@@ -314,7 +314,7 @@ internal sealed class TrayContext : ApplicationContext {
         remapper = new KeyRemapper();
         miKeymapF2.Checked = true;    // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
         remapper.F2Enabled = true;
-        miKeymapWin.Checked = true;   // 默认开启:左 Win 变左 Ctrl(右 Win 保留开始菜单)
+        miKeymapWin.Checked = true;   // 默认开启:右 Win 变右 Ctrl(左 Win 保留开始菜单)
         remapper.WinEnabled = true;
 
         miAutoStart.Checked = AutoStartEnabled();

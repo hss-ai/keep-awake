@@ -1,8 +1,8 @@
-// key_remap.cs — 全局键映射:F2 → Ctrl+W、左 Win → 左 Ctrl(低级键盘钩子)
+// key_remap.cs — 全局键映射:F2 → Ctrl+W、右 Win → 右 Ctrl(低级键盘钩子)
 //
 // 背景:用户此前装 PowerToys 只为 Keyboard Manager 的一条映射(F2→Ctrl+W),
-// 集成进托盘后即可卸掉 PowerToys;左 Win → 左 Ctrl 是后加的第二条(键盘上
-// Win 键易误触开始菜单,改充 Ctrl 物尽其用)。
+// 集成进托盘后即可卸掉 PowerToys;右 Win → 右 Ctrl 是后加的第二条(键盘上
+// 右 Win 闲着易误触,改充 Ctrl 物尽其用;左 Win 要开开始菜单,保留原义)。
 //
 // 机制(两条映射共用一个 WH_KEYBOARD_LL 钩子,各自独立开关):
 //   1) 低级钩子拦在全系统键盘流最前面,装在独立线程(自有 GetMessage 消息循环):
@@ -10,10 +10,10 @@
 //   2) F2 按下:吞掉原键 → 若此刻 Ctrl 未按下则补按左 Ctrl → 按下 W;
 //      F2 抬起:吞掉 → 抬起 W → 若 Ctrl 是我们补按的才一并抬起
 //      (用户自己按着的 Ctrl 绝不替他抬,松开后仍保持);
-//   3) 左 Win 按下:吞掉原键 → 若此刻 Ctrl 未按下则补按左 Ctrl;抬起:吞掉 →
-//      补抬(同样是"自己按着的 Ctrl 不碰")。左 Win 从此等于左 Ctrl:
-//      开始菜单、Win+D/E/L 等系统快捷键在左 Win 上失效——这正是映射的
-//      预期语义,要开开始菜单用右 Win 或菜单里关掉本映射;
+//   3) 右 Win 按下:吞掉原键 → 若此刻 Ctrl 未按下则补按右 Ctrl;抬起:吞掉 →
+//      补抬(同样是"自己按着的 Ctrl 不碰")。右 Win 从此等于右 Ctrl:
+//      右侧的 Win 系统快捷键失效——这正是映射的预期语义,
+//      开始菜单/Win+D/E/L 照常用左 Win,或菜单里关掉本映射;
 //   4) keyup 只在对应 keydown 是我们吞掉时才吞:按住原键期间开关状态翻转
 //      (如映射从关到开:keydown 直通、keyup 却被吞)会让修饰键缺 up 而粘键,
 //      系统从此认为 Win 一直按着、所有按键变 Win+ 组合——v1.4.3 修
@@ -29,7 +29,7 @@
 //      不会粘键;回调整体 try/catch,钩子线程异常绝不带崩进程。
 // 语义细节:按住其它修饰键(Shift/Alt/另一侧 Win)再按 F2,修饰键自然保留
 //   (与物理按键模型一致,PowerToys 键映射同语义);F2 本义(重命名)、
-//   左 Win 本义(开始菜单)全局被替换。
+//   右 Win 本义(Win 系统快捷键)全局被替换,左 Win 不受影响。
 // 限制:安全桌面(UAC 弹窗)与管理员窗口的按键不经本钩子
 //   (未提权进程的固有限制,PowerToys 不提权时同样如此)。
 // 注意:C# 5 语法(系统 csc 不认 C#6+),不要用字符串插值 $""、?. 等。
@@ -45,8 +45,9 @@ internal sealed class KeyRemapper : IDisposable {
     // 映射定义:原键 → 目标。要改映射只动这些常量 + 菜单文案。
     private const ushort VkF2 = 0x71;      // VK_F2(原键,映射一)
     private const ushort VkW = 0x57;       // 'W'
-    private const ushort VkLWin = 0x5B;    // VK_LWIN(原键,映射二)
-    private const ushort VkLCtrl = 0xA2;   // VK_LCONTROL(映射一/二共用的补按目标)
+    private const ushort VkLCtrl = 0xA2;   // VK_LCONTROL(映射一的补按目标)
+    private const ushort VkRWin = 0x5C;    // VK_RWIN(原键,映射二)
+    private const ushort VkRCtrl = 0xA3;   // VK_RCONTROL(映射二目标)
 
     private const int WH_KEYBOARD_LL = 13;
     private const int HC_ACTION = 0;
@@ -126,7 +127,7 @@ internal sealed class KeyRemapper : IDisposable {
     // 以下四项仅钩子线程访问
     private bool f2Down;        // F2 的 keydown 被我们吞了(欠一组抬起)
     private bool f2WeCtrl;      // F2 映射补按的 Ctrl 还欠抬起
-    private bool winDown;       // 左 Win 的 keydown 被我们吞了
+    private bool winDown;       // 右 Win 的 keydown 被我们吞了
     private bool winWeCtrl;     // Win 映射补按的 Ctrl 还欠抬起
 
     public KeyRemapper() {
@@ -147,13 +148,13 @@ internal sealed class KeyRemapper : IDisposable {
         }
     }
 
-    /// <summary>左Win→左Ctrl 开关(同上)。</summary>
+    /// <summary>右Win→右Ctrl 开关(同上)。</summary>
     public bool WinEnabled {
         get { return winEnabled; }
         set {
             if (winEnabled == value) return;
             winEnabled = value;
-            AppLog.Write("键映射 Win(左)→Ctrl(左): " + (value ? "开启" : "关闭"));
+            AppLog.Write("键映射 Win(右)→Ctrl(右): " + (value ? "开启" : "关闭"));
         }
     }
 
@@ -164,7 +165,7 @@ internal sealed class KeyRemapper : IDisposable {
             AppLog.Write("键映射:WH_KEYBOARD_LL 安装失败 err=" + Marshal.GetLastWin32Error() + ",键映射不可用");
             return;
         }
-        AppLog.Write("键映射:键盘钩子已安装(F2→Ctrl+W、Win左→Ctrl左)");
+        AppLog.Write("键映射:键盘钩子已安装(F2→Ctrl+W、Win右→Ctrl右)");
         MSG msg;
         while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
             TranslateMessage(ref msg);
@@ -196,7 +197,7 @@ internal sealed class KeyRemapper : IDisposable {
         bool upMsg = msg == WM_KEYUP || msg == WM_SYSKEYUP;
         bool swallow;
         if (k.VkCode == VkF2) swallow = HandleF2(downMsg, upMsg);
-        else if (k.VkCode == VkLWin) swallow = HandleLWin(downMsg, upMsg);
+        else if (k.VkCode == VkRWin) swallow = HandleRWin(downMsg, upMsg);
         else return CallNextHookEx(hook, nCode, wParam, lParam);
         return swallow ? new IntPtr(1) : CallNextHookEx(hook, nCode, wParam, lParam);
     }
@@ -223,15 +224,15 @@ internal sealed class KeyRemapper : IDisposable {
         return false;
     }
 
-    // 左 Win → 左 Ctrl。返回 true = 吞掉本事件。
-    private bool HandleLWin(bool downMsg, bool upMsg) {
+    // 右 Win → 右 Ctrl。返回 true = 吞掉本事件。
+    private bool HandleRWin(bool downMsg, bool upMsg) {
         if (downMsg) {
             if (!winEnabled) return false;
             if (!winDown) {
                 winDown = true;
                 // 只补按用户没按着的 Ctrl(任一侧):他自己的 Ctrl 绝不重复、也绝不替他抬
                 winWeCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0;
-                if (winWeCtrl) SendKey(VkLCtrl, false);
+                if (winWeCtrl) SendKey(VkRCtrl, false);
             }
             return true;   // 吞掉(含自动重复:修饰键没有重复注入的意义)
         }
@@ -256,7 +257,7 @@ internal sealed class KeyRemapper : IDisposable {
     private void ReleaseWinHeld() {
         if (!winDown) return;
         winDown = false;
-        if (winWeCtrl) { SendKey(VkLCtrl, true); winWeCtrl = false; }
+        if (winWeCtrl) { SendKey(VkRCtrl, true); winWeCtrl = false; }
     }
 
     private static void SendKey(ushort vk, bool up) {

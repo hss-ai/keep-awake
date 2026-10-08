@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""probe_keymap.py — 端到端验证全局键映射 F2→Ctrl+W 与 左Win→左Ctrl(跑前先用 build_keep_awake.py 装新版)。
+"""probe_keymap.py — 端到端验证全局键映射 F2→Ctrl+W 与 右Win→右Ctrl(跑前先用 build_keep_awake.py 装新版)。
 
 架构(v2,钩子录音机):探针 = WH_KEYBOARD_LL 录音钩子 + 一个窗体。
   - 录音钩子先于被测 KeepAwake 装进链(后装在链头),原键与 KeepAwake 注入的键全都录到,
@@ -14,7 +14,7 @@
      录音机在链头故原键可见,吞的效果由"注入键恰好成组、无多余"体现);
   B) F2 外部按着 Ctrl:→ 只补 W 不补 C(无 K 来源的 C),也不替外部抬;
   C) F2 自动重复:4×F2↓ + 1×F2↑ → 只产出一次 W 组合;
-  D) Win 基本映射:Tap 左Win → [LWIN↓T, C↓K, LWIN↑T, C↑K];
+  D) Win 基本映射:Tap 右Win → [RWIN↓T, C↓K, RWIN↑T, C↑K];
   E) Win 外部按着 Ctrl:→ 无任何 K 注入;
   F) Win 自动重复:4×WIN↓ + 1×WIN↑ → 只产出一次 Ctrl 按压对。
 清理:杀被测 exe → 恢复已装版本。
@@ -28,7 +28,7 @@ import time
 from ctypes import wintypes
 
 CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-VK_F2, VK_W, VK_LCONTROL, VK_CONTROL, VK_LWIN = 0x71, 0x57, 0xA2, 0x11, 0x5B
+VK_F2, VK_W, VK_LCONTROL, VK_CONTROL, VK_RWIN = 0x71, 0x57, 0xA2, 0x11, 0x5C
 CTRL_VKS = (0x11, 0xA2, 0xA3)  # WM_KEYDOWN 的 wParam 可能给 VK_CONTROL 也可能给 L/R 原码
 
 # 探针(v2):窗体 + WH_KEYBOARD_LL 录音钩子(装在窗体线程)。窗体拿到前台后写 READY;
@@ -275,8 +275,8 @@ def parse_sections(path):
             token = "W"
         elif vk in CTRL_VKS:
             token = "C"
-        elif vk == VK_LWIN:
-            token = "LWIN"
+        elif vk == VK_RWIN:
+            token = "RWIN"
         else:
             continue
         sections.setdefault(cur, []).append((parts[0], token, origin))
@@ -295,16 +295,16 @@ SCENARIOS = [
         [send_key(VK_F2) or time.sleep(0.06) for _ in range(4)],
         time.sleep(0.2),
         send_key(VK_F2, up=True))),
-    ("D", lambda: tap(VK_LWIN)),
+    ("D", lambda: tap(VK_RWIN)),
     ("E", lambda: (
         send_key(VK_LCONTROL), time.sleep(0.05),
-        send_key(VK_LWIN), time.sleep(0.05),
-        send_key(VK_LWIN, up=True), time.sleep(0.05),
+        send_key(VK_RWIN), time.sleep(0.05),
+        send_key(VK_RWIN, up=True), time.sleep(0.05),
         send_key(VK_LCONTROL, up=True))),
     ("F", lambda: (
-        [send_key(VK_LWIN) or time.sleep(0.06) for _ in range(4)],
+        [send_key(VK_RWIN) or time.sleep(0.06) for _ in range(4)],
         time.sleep(0.2),
-        send_key(VK_LWIN, up=True))),
+        send_key(VK_RWIN, up=True))),
 ]
 
 # 录音序列期望。T=测试注入的原键(录音钩子在链头先于 KeepAwake,原键可见);
@@ -317,12 +317,12 @@ EXPECTED = {
           ("up", "F2", "T"), ("up", "W", "K"), ("up", "C", "T")],
     "C": [("down", "F2", "T")] + _QUAD_MID + [("down", "F2", "T")] * 3
          + [("up", "F2", "T")] + _QUAD_END,
-    "D": [("down", "LWIN", "T"), ("down", "C", "K"),
-          ("up", "LWIN", "T"), ("up", "C", "K")],
-    "E": [("down", "C", "T"), ("down", "LWIN", "T"),
-          ("up", "LWIN", "T"), ("up", "C", "T")],
-    "F": [("down", "LWIN", "T"), ("down", "C", "K")] + [("down", "LWIN", "T")] * 3
-         + [("up", "LWIN", "T"), ("up", "C", "K")],
+    "D": [("down", "RWIN", "T"), ("down", "C", "K"),
+          ("up", "RWIN", "T"), ("up", "C", "K")],
+    "E": [("down", "C", "T"), ("down", "RWIN", "T"),
+          ("up", "RWIN", "T"), ("up", "C", "T")],
+    "F": [("down", "RWIN", "T"), ("down", "C", "K")] + [("down", "RWIN", "T")] * 3
+         + [("up", "RWIN", "T"), ("up", "C", "K")],
 }
 
 # 破坏性场景:输出含真实 W 键,必须由探针窗体持有前台(安全目的地)才允许注入。
