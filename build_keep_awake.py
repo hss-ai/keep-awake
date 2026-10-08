@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs + explorer_tab_merge.cs + key_remap.cs + shortcut_arrow.cs → KeepAwake.exe)一键构建
+"""build_keep_awake.py — 防待机托盘工具(keep_awake_tray.cs + explorer_tab_merge.cs + key_remap.cs + shortcut_arrow.cs + audio_mute.cs → KeepAwake.exe)一键构建
 
 流程:
   1) PIL 生成 keep_awake.ico(绿圆底+白咖啡杯,与托盘三态图标同款设计);
@@ -37,6 +37,7 @@ SRC_FILES = [
     os.path.join(HERE, "explorer_tab_merge.cs"),    # 资源管理器单窗口合并(dynamic COM 需 Microsoft.CSharp)
     os.path.join(HERE, "key_remap.cs"),             # 全局键映射 F2→Ctrl+W、Win右→Ctrl右(低级键盘钩子)
     os.path.join(HERE, "shortcut_arrow.cs"),        # 去除快捷方式小箭头(HKLM Shell Icons\29)
+    os.path.join(HERE, "audio_mute.cs"),            # 启动时静音(Core Audio COM 直调 IAudioEndpointVolume)
 ]
 MANIFEST = os.path.join(HERE, "app.manifest")       # dpiAware=true:进程从头 system DPI aware
 BUILD_DIR = os.path.join(HERE, "build")

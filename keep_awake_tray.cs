@@ -4,7 +4,7 @@
 //   csc /nologo /target:winexe /codepage:65001 /optimize+ /win32icon:keep_awake.ico
 //       /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:Microsoft.CSharp.dll
 //       /r:UIAutomationClient.dll /r:UIAutomationTypes.dll  (仅 GAC 有,构建脚本负责解析路径)
-//       /out:KeepAwake.exe keep_awake_tray.cs explorer_tab_merge.cs key_remap.cs shortcut_arrow.cs
+//       /out:KeepAwake.exe keep_awake_tray.cs explorer_tab_merge.cs key_remap.cs shortcut_arrow.cs audio_mute.cs
 //
 // 行为:
 //   - 启动即开启「系统防待机」(屏幕允许自动关),托盘弹气泡提示;
@@ -16,6 +16,9 @@
 //       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
 //       20ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
+//     ✔启动时静音(每次进程真正跑起来——手动双击或开机自启——都把默认播放设备
+//       SetMute 静音:幂等"设置"非切换、不改音量值,取消静音即恢复原音量;
+//       开关持久化 HKCU Software\KeepAwakePrefs 默认开,详见 audio_mute.cs) /
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
 //       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) / 退出;
 //   - 唤醒请求只挂在本进程(SetThreadExecutionState),退出/被杀/注销系统自动撤销;
@@ -242,6 +245,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miKeymapF2;  // └ F2 → Ctrl+W
     readonly ToolStripMenuItem miKeymapWin; // └ Win(右) → Ctrl(右)
     readonly ToolStripMenuItem miAutoStart;
+    readonly ToolStripMenuItem miMuteStartup;  // 启动时静音(默认开,持久化 HKCU)
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
     readonly System.Windows.Forms.Timer timer;
@@ -253,7 +257,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.5)");
+        AppLog.Write("启动(v1.4.6)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -277,6 +281,8 @@ internal sealed class TrayContext : ApplicationContext {
         miKeymap.DropDownItems.Add(miKeymapWin);
         miAutoStart = new ToolStripMenuItem("开机自启");
         miAutoStart.Click += OnToggleAutoStart;
+        miMuteStartup = new ToolStripMenuItem("启动时静音");
+        miMuteStartup.Click += OnToggleMuteStartup;
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
         miArrow.Click += OnToggleArrow;
         miMore = new ToolStripMenuItem("更多工具");
@@ -291,6 +297,7 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(miExplorer);
         menu.Items.Add(miKeymap);
         menu.Items.Add(miAutoStart);
+        menu.Items.Add(miMuteStartup);
         menu.Items.Add(miMore);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miExit);
@@ -322,11 +329,17 @@ internal sealed class TrayContext : ApplicationContext {
         miAutoStart.Checked = AutoStartEnabled();
         if (miAutoStart.Checked) SetAutoStart(true); // 路径自愈:exe 挪窝后指向当前实例
 
+        // 启动时静音:手动双击/开机自启走的是同一条路,都在这里;Mutex 挡掉的
+        // 重复启动到不了这里,不会二次静音。开关关着就完全不碰音频。
+        miMuteStartup.Checked = MuteAtStartupPref.Get();
+        if (miMuteStartup.Checked) StartupMute.Apply();
+
         miArrow.Checked = ShortcutArrowCleaner.IsEnabled(); // 小箭头状态以 HKLM 实况为准
 
         TurnOn(); // 启动即开启
         tray.BalloonTipTitle = "防待机已开启";
-        tray.BalloonTipText = "资源管理器合并、键映射(F2→Ctrl+W、Win→Ctrl)已启动。左键图标:开/关防待机;右键菜单更多。";
+        string muteNote = miMuteStartup.Checked ? "已按「启动时静音」把系统音量静音,要出声按音量键。\n" : "";
+        tray.BalloonTipText = muteNote + "资源管理器合并、键映射(F2→Ctrl+W、Win→Ctrl)已启动。左键图标:开/关防待机;右键菜单更多。";
         tray.ShowBalloonTip(2500);
     }
 
@@ -450,6 +463,13 @@ internal sealed class TrayContext : ApplicationContext {
             if (on) key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\"");
             else key.DeleteValue(RunValueName, false);
         }
+    }
+
+    void OnToggleMuteStartup(object sender, EventArgs e) {
+        // 只翻偏好(下次启动生效与否),不立刻动音频——条目名就是"启动时"静音,
+        // 立即静音交给音量键,与「开机自启」开关同款纯偏好语义
+        miMuteStartup.Checked = !miMuteStartup.Checked;
+        MuteAtStartupPref.Set(miMuteStartup.Checked);
     }
 
     void TrayMouseClick(object sender, MouseEventArgs e) {
