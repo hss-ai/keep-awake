@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""probe_keymap.py — 端到端验证全局键映射 F2→Ctrl+W 与 右Win→右Ctrl(跑前先用 build_keep_awake.py 装新版)。
+"""probe_keymap.py — 端到端验证全局键映射:F2→Ctrl+W、右Win→右Ctrl(含三件套识别)。
 
 架构(v2,钩子录音机):探针 = WH_KEYBOARD_LL 录音钩子 + 一个窗体。
   - 录音钩子先于被测 KeepAwake 装进链(后装在链头),原键与 KeepAwake 注入的键全都录到,
@@ -7,16 +7,22 @@
     用户打字不干扰测试——v1 窗口消息版对前台焦点强依赖,实测用户打个字就把场景打断)。
   - 窗体只为「有破坏性的场景」提供安全的目的地:F2→Ctrl+W 的 W 是真按键,前台若是用户
     正在用的窗口会真关人家标签页——A/B/C 注入前守护前台,失焦等待重试、超时跳过;
-  - D/E/F(Win→Ctrl)输出只有孤立的 Ctrl 单键,无破坏性,无需前台、直接注入。
+  - 其余场景(Win 系)输出只有孤立的 Ctrl 单键或弹一下开始菜单(H 后自动 ESC 清场),
+    无破坏性,无需前台、直接注入。
 
 场景与判据(录音序列,K/T 按来源精确比对):
-  A) F2 基本映射:Tap F2 → [F2↓T, C↓K, W↓K, F2↑T, W↑K, C↑K](KeepAwake 吞 F2 补 Ctrl+W;
-     录音机在链头故原键可见,吞的效果由"注入键恰好成组、无多余"体现);
-  B) F2 外部按着 Ctrl:→ 只补 W 不补 C(无 K 来源的 C),也不替外部抬;
+  A) F2 基本映射:Tap F2 → [F2↓T, C↓K, W↓K, F2↑T, W↑K, C↑K];
+  B) F2 外部按着 Ctrl:→ 只补 W 不补 C,也不替外部抬;
   C) F2 自动重复:4×F2↓ + 1×F2↑ → 只产出一次 W 组合;
-  D) Win 基本映射:Tap 右Win → [RWIN↓T, C↓K, RWIN↑T, C↑K];
-  E) Win 外部按着 Ctrl:→ 无任何 K 注入;
-  F) Win 自动重复:4×WIN↓ + 1×WIN↑ → 只产出一次 Ctrl 按压对。
+  D) 标准右 Win 直映射:Tap 0x5C → [RWIN↓T, C↓K, RWIN↑T, C↑K];
+  E) 标准右 Win 外部按着 Ctrl:→ 无任何 K 注入;
+  F) 标准右 Win 自动重复:→ 只产出一次 Ctrl 按压对;
+  G) 三件套基本映射(用户键盘实测形态:5B↓,+10ms A0↓,+10ms 86↓):
+     → [LWIN↓T, SH↓T, C↓K, F23↓T, F23↑T, SH↑T, LWIN↑T, C↑K](三件全吞+右Ctrl);
+  H) 纯左 Win:Tap 0x5B → [LWIN↓T, LWIN↓K(20ms 判定超时后原样补发), LWIN↑T]
+     (之后注入 ESC 清掉弹出的开始菜单,不在断言内);
+  I) 三件套 + 外部按着 Ctrl:→ 坐实但不注入、不替外部抬;
+  J) 三件套长按(整体重复形态 ×3):→ 只产出一次 Ctrl 按压对。
 清理:杀被测 exe → 恢复已装版本。
 """
 import ctypes
@@ -28,7 +34,8 @@ import time
 from ctypes import wintypes
 
 CSC = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-VK_F2, VK_W, VK_LCONTROL, VK_CONTROL, VK_RWIN = 0x71, 0x57, 0xA2, 0x11, 0x5C
+VK_F2, VK_W, VK_LCONTROL, VK_CONTROL = 0x71, 0x57, 0xA2, 0x11
+VK_RWIN, VK_LWIN, VK_LSHIFT, VK_F23, VK_ESCAPE = 0x5C, 0x5B, 0xA0, 0x86, 0x1B
 CTRL_VKS = (0x11, 0xA2, 0xA3)  # WM_KEYDOWN 的 wParam 可能给 VK_CONTROL 也可能给 L/R 原码
 
 # 探针(v2):窗体 + WH_KEYBOARD_LL 录音钩子(装在窗体线程)。窗体拿到前台后写 READY;
@@ -277,13 +284,36 @@ def parse_sections(path):
             token = "C"
         elif vk == VK_RWIN:
             token = "RWIN"
+        elif vk == VK_LWIN:
+            token = "LWIN"
+        elif vk == VK_LSHIFT:
+            token = "SH"
+        elif vk == VK_F23:
+            token = "F23"
         else:
             continue
         sections.setdefault(cur, []).append((parts[0], token, origin))
     return sections
 
 
-# 每场景的注入脚本。B/E 用外部 Ctrl 的按下/抬起包住原键按压,验证"不重复补按、不替外部抬"。
+def trio_tap(repeats=1):
+    """模拟用户键盘的右侧 Win 合成键:5B↓ →+10ms A0↓ →+10ms 86↓(整体重复 repeats 次),
+    再逆序抬起。间隔照实测采样(10ms/10ms)。"""
+    for _ in range(repeats):
+        send_key(VK_LWIN)
+        time.sleep(0.01)
+        send_key(VK_LSHIFT)
+        time.sleep(0.01)
+        send_key(VK_F23)
+        time.sleep(0.05)
+    send_key(VK_F23, up=True)
+    time.sleep(0.01)
+    send_key(VK_LSHIFT, up=True)
+    time.sleep(0.01)
+    send_key(VK_LWIN, up=True)
+
+
+# 每场景的注入脚本。B/E/I 用外部 Ctrl 的按下/抬起包住原键按压,验证"不重复补按、不替外部抬"。
 SCENARIOS = [
     ("A", lambda: tap(VK_F2)),
     ("B", lambda: (
@@ -305,12 +335,26 @@ SCENARIOS = [
         [send_key(VK_RWIN) or time.sleep(0.06) for _ in range(4)],
         time.sleep(0.2),
         send_key(VK_RWIN, up=True))),
+    ("G", lambda: trio_tap(1)),
+    ("H", lambda: (
+        send_key(VK_LWIN), time.sleep(0.06), send_key(VK_LWIN, up=True),
+        time.sleep(0.35),                       # 等开始菜单弹出
+        tap(VK_ESCAPE))),                       # 清场,ESC 不在断言 token 集
+    ("I", lambda: (
+        send_key(VK_LCONTROL), time.sleep(0.05),
+        trio_tap(1),
+        time.sleep(0.05),
+        send_key(VK_LCONTROL, up=True))),
+    ("J", lambda: trio_tap(3)),
 ]
 
 # 录音序列期望。T=测试注入的原键(录音钩子在链头先于 KeepAwake,原键可见);
 # K=KeepAwake 注入的目标键。原键被吞的效果 = 目标键恰好成组出现、无多余注入。
 _QUAD_MID = [("down", "C", "K"), ("down", "W", "K")]           # F2↓ 触发的注入
 _QUAD_END = [("up", "W", "K"), ("up", "C", "K")]               # F2↑ 触发的补抬
+_TRIO_HEAD = [("down", "LWIN", "T"), ("down", "SH", "T")]      # 三件套头两件(5B↓,A0↓)
+_TRIO_TAIL = [("up", "F23", "T"), ("up", "SH", "T"), ("up", "LWIN", "T")]  # 抬起三连
+_TRIO_REP = [("down", "LWIN", "T"), ("down", "SH", "T"), ("down", "F23", "T")]  # 一组重复
 EXPECTED = {
     "A": [("down", "F2", "T")] + _QUAD_MID + [("up", "F2", "T")] + _QUAD_END,
     "B": [("down", "C", "T"), ("down", "F2", "T"), ("down", "W", "K"),
@@ -323,10 +367,21 @@ EXPECTED = {
           ("up", "RWIN", "T"), ("up", "C", "T")],
     "F": [("down", "RWIN", "T"), ("down", "C", "K")] + [("down", "RWIN", "T")] * 3
          + [("up", "RWIN", "T"), ("up", "C", "K")],
+    # G:5B↓ 暂扣 → A0↓ 坐实(此刻注入 C↓K)→ 86↓/抬起全吞 → 5B↑ 还账 C↑K
+    "G": _TRIO_HEAD + [("down", "C", "K"), ("down", "F23", "T")] + _TRIO_TAIL
+         + [("up", "C", "K")],
+    # H:纯左 Win——20ms 判定超时后 KeepAwake 原样补发(魔数 K);up 直通配对
+    "H": [("down", "LWIN", "T"), ("down", "LWIN", "K"), ("up", "LWIN", "T")],
+    # I:外部 Ctrl 按着 → 坐实三件套但零注入
+    "I": [("down", "C", "T")] + _TRIO_HEAD + [("down", "F23", "T")] + _TRIO_TAIL
+         + [("up", "C", "T")],
+    # J:整体重复 ×3 → 只第一组注入一次 Ctrl 按压
+    "J": _TRIO_HEAD + [("down", "C", "K"), ("down", "F23", "T")] + _TRIO_REP * 2
+         + _TRIO_TAIL + [("up", "C", "K")],
 }
 
 # 破坏性场景:输出含真实 W 键,必须由探针窗体持有前台(安全目的地)才允许注入。
-# 其余场景输出仅孤立 Ctrl 单键,对任何前台窗口均无副作用。
+# 其余场景输出仅孤立 Ctrl 单键(H 弹一次开始菜单随即 ESC 清场),无破坏性。
 HARMFUL = {"A", "B", "C"}
 
 
@@ -352,7 +407,7 @@ def main():
         os.remove(result_path)
 
     ok = False
-    probe = subprocess.Popen([probe_exe, result_path, "45"])
+    probe = subprocess.Popen([probe_exe, result_path, "70"])
     try:
         if not wait_marker(result_path, "READY", 10):
             print("探针 10s 内未取得前台,放弃")
@@ -388,9 +443,10 @@ def main():
                 print("  [%s] %s" % (tag, show))
                 if got != want:
                     failures.append("%s 序列不符:期望 %s" % (tag, want))
-            # A 与 D 至少其一真实跑过,才算测到了映射本体(全 skip = 白跑)
-            if not ({"A", "D"} & set(done_tags)):
-                failures.append("A/D 均未实跑(前台全程被占用),映射本体未验证")
+            # 核心场景(A=F2 本体 / D=标准右Win / G=三件套,用户键盘的实际形态)
+            # 至少其一真实跑过,才算测到了映射本体(全 skip = 白跑)
+            if not ({"A", "D", "G"} & set(done_tags)):
+                failures.append("A/D/G 均未实跑(前台全程被占用),映射本体未验证")
             ok = not failures
             for msg in failures:
                 print("  ✗", msg)

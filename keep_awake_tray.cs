@@ -12,7 +12,9 @@
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
 //     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11) /
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
-//       Keyboard Manager;两条映射各自独立开关,左 Win 保留原义) /
+//       Keyboard Manager;两条映射各自独立开关。Win(右)含三件套识别:用户
+//       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
+//       20ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
 //       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) / 退出;
@@ -251,7 +253,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.4)");
+        AppLog.Write("启动(v1.4.5)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
