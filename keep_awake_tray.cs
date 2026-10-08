@@ -11,7 +11,8 @@
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
 //     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11) /
-//     ✔键映射 F2→Ctrl+W(低级键盘钩子,接替 PowerToys Keyboard Manager) /
+//     键映射▸✔F2→Ctrl+W ✔Win(左)→Ctrl(左)(低级键盘钩子,接替 PowerToys
+//       Keyboard Manager;两条映射各自独立开关,v1.4.3 起) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
 //       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) / 退出;
@@ -235,7 +236,9 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miOn;
     readonly ToolStripMenuItem miDisplay;
     readonly ToolStripMenuItem miExplorer;
-    readonly ToolStripMenuItem miKeymap;
+    readonly ToolStripMenuItem miKeymap;    // 键映射(父项):映射多了,收进二级菜单
+    readonly ToolStripMenuItem miKeymapF2;  // └ F2 → Ctrl+W
+    readonly ToolStripMenuItem miKeymapWin; // └ Win(左) → Ctrl(左)
     readonly ToolStripMenuItem miAutoStart;
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
@@ -244,11 +247,11 @@ internal sealed class TrayContext : ApplicationContext {
     readonly Icon iconOnDisplay;
     readonly Icon iconOff;
     readonly ExplorerTabMerger merger;   // 资源管理器单窗口合并(默认开)
-    readonly KeyRemapper remapper;       // F2→Ctrl+W 键映射(默认开)
+    readonly KeyRemapper remapper;       // 全局键映射(两条,默认开)
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.2)");
+        AppLog.Write("启动(v1.4.3)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -263,8 +266,13 @@ internal sealed class TrayContext : ApplicationContext {
         miDisplay.Click += OnToggleDisplay;
         miExplorer = new ToolStripMenuItem("资源管理器单窗口合并");
         miExplorer.Click += OnToggleExplorer;
-        miKeymap = new ToolStripMenuItem("键映射 F2→Ctrl+W");
-        miKeymap.Click += OnToggleKeymap;
+        miKeymapF2 = new ToolStripMenuItem("F2 → Ctrl+W");
+        miKeymapF2.Click += OnToggleKeymapF2;
+        miKeymapWin = new ToolStripMenuItem("Win(左) → Ctrl(左)");
+        miKeymapWin.Click += OnToggleKeymapWin;
+        miKeymap = new ToolStripMenuItem("键映射");
+        miKeymap.DropDownItems.Add(miKeymapF2);
+        miKeymap.DropDownItems.Add(miKeymapWin);
         miAutoStart = new ToolStripMenuItem("开机自启");
         miAutoStart.Click += OnToggleAutoStart;
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
@@ -304,8 +312,10 @@ internal sealed class TrayContext : ApplicationContext {
         merger.Enabled = true;
 
         remapper = new KeyRemapper();
-        miKeymap.Checked = true;   // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
-        remapper.Enabled = true;
+        miKeymapF2.Checked = true;    // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
+        remapper.F2Enabled = true;
+        miKeymapWin.Checked = true;   // 默认开启:左 Win 变左 Ctrl(右 Win 保留开始菜单)
+        remapper.WinEnabled = true;
 
         miAutoStart.Checked = AutoStartEnabled();
         if (miAutoStart.Checked) SetAutoStart(true); // 路径自愈:exe 挪窝后指向当前实例
@@ -314,7 +324,7 @@ internal sealed class TrayContext : ApplicationContext {
 
         TurnOn(); // 启动即开启
         tray.BalloonTipTitle = "防待机已开启";
-        tray.BalloonTipText = "资源管理器合并、F2→Ctrl+W 键映射已启动。左键图标:开/关防待机;右键菜单更多。";
+        tray.BalloonTipText = "资源管理器合并、键映射(F2→Ctrl+W、Win→Ctrl)已启动。左键图标:开/关防待机;右键菜单更多。";
         tray.ShowBalloonTip(2500);
     }
 
@@ -356,9 +366,14 @@ internal sealed class TrayContext : ApplicationContext {
         merger.Enabled = miExplorer.Checked;
     }
 
-    void OnToggleKeymap(object sender, EventArgs e) {
-        miKeymap.Checked = !miKeymap.Checked;
-        remapper.Enabled = miKeymap.Checked;
+    void OnToggleKeymapF2(object sender, EventArgs e) {
+        miKeymapF2.Checked = !miKeymapF2.Checked;
+        remapper.F2Enabled = miKeymapF2.Checked;
+    }
+
+    void OnToggleKeymapWin(object sender, EventArgs e) {
+        miKeymapWin.Checked = !miKeymapWin.Checked;
+        remapper.WinEnabled = miKeymapWin.Checked;
     }
 
     void OnToggleAutoStart(object sender, EventArgs e) {

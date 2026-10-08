@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_FILES = [
     os.path.join(HERE, "keep_awake_tray.cs"),       # 托盘主程序(防待机 + 菜单)
     os.path.join(HERE, "explorer_tab_merge.cs"),    # 资源管理器单窗口合并(dynamic COM 需 Microsoft.CSharp)
-    os.path.join(HERE, "key_remap.cs"),             # 全局键映射 F2→Ctrl+W(低级键盘钩子)
+    os.path.join(HERE, "key_remap.cs"),             # 全局键映射 F2→Ctrl+W、Win左→Ctrl左(低级键盘钩子)
     os.path.join(HERE, "shortcut_arrow.cs"),        # 去除快捷方式小箭头(HKLM Shell Icons\29)
 ]
 MANIFEST = os.path.join(HERE, "app.manifest")       # dpiAware=true:进程从头 system DPI aware
