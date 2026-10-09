@@ -526,38 +526,96 @@ internal sealed class ExplorerTabMerger : IDisposable {
         return false;
     }
 
-    /// <summary>目标窗口名下已有位于 path 的标签时,激活那条标签(UIA SelectionItem.Select),
-    /// 免开重复标签。索引映射:Shell 枚举同 HWND 记录序 == UIA TabListView 子项序
-    /// (2026-10-07 探针实测一一对应,TabItem 的 Name 是本地化显示名无法按路径匹配,
-    /// 只能靠索引);UIA 走独立线程+Join 超时(与 AddButton 同源的挂死风险);激活以
-    /// 「目标窗口标题变为新窗口的显示名」核实(新窗口此刻已导航到目标,标题即显示名,
-    /// 虚拟位置同样成立)。失败返回 false,落回「新开标签」的既有路径,行为不劣化。</summary>
+    /// <summary>目标窗口名下已有位于候选路径的标签时,激活那条标签(UIA SelectionItem.Select),
+    /// 免开重复标签。候选优先级:①/select 打开的新窗口先读选中项——reveal 目录时选中=目录
+    /// 本身、reveal 文件时选中=文件,用户心智锚定的是选中的那个东西(容器只是 explorer 的
+    /// 实现细节:/select,etopo 打开的容器是父目录 raw,若只认容器会在开着 etopo 标签的
+    /// 时候新开 raw 标签,v1.4.2 的漏网形态);②容器路径本身。
+    /// 索引映射:Shell 枚举同 HWND 记录序 == UIA TabListView 子项序(2026-10-07 探针
+    /// 实测一一对应,TabItem 的 Name 是本地化显示名无法按路径匹配,只能靠索引);UIA 走
+    /// 独立线程+Join 超时(与 AddButton 同源的挂死风险);激活以「目标窗口标题变为候选的
+    /// 显示名」核实。全部候选失败返回 false,落回「新开标签」的既有路径,行为不劣化。</summary>
     private static bool ActivateExistingTab(IntPtr target, string path, IntPtr newHwnd) {
-        int idx = ComCall(2000, delegate() { return TabIndexOf(target, path); }, -1);
-        if (idx < 0) return false;                       // 无同路径标签:该走新开标签
+        string sel = ComCall(1500, delegate() { return GetSelectedPath(newHwnd); }, null);
+        string selDir = null;
+        if (!string.IsNullOrEmpty(sel))
+            selDir = Directory.Exists(sel) ? sel : Path.GetDirectoryName(sel);
+        if (selDir != null && !string.Equals(selDir, path, StringComparison.OrdinalIgnoreCase)) {
+            if (TryActivateTab(target, selDir, Path.GetFileName(selDir.TrimEnd('\\')))) {
+                Log("既有标签激活: 命中选中项所在目录 → " + selDir);
+                return true;
+            }
+        }
         string display = GetTitle(newHwnd);
         int dash = display.IndexOf(" - 文件资源管理器");
         if (dash > 0) display = display.Substring(0, dash);
-        if (display.Length == 0) return false;
+        return TryActivateTab(target, path, display);
+    }
+
+    /// <summary>单候选:target 名下有 cand 标签则 UIA 激活并按显示名核实。</summary>
+    private static bool TryActivateTab(IntPtr target, string cand, string display) {
+        if (string.IsNullOrEmpty(cand) || string.IsNullOrEmpty(display)) return false;
+        int idx = ComCall(2000, delegate() { return TabIndexOf(target, cand); }, -1);
+        if (idx < 0) return false;                        // 该候选无同路径标签
         bool selected = false;
         for (int attempt = 1; attempt <= 2 && !selected; attempt++) {
             selected = UiaSelectTab(target, idx);
             if (!selected) Thread.Sleep(200);
         }
         if (!selected) {
-            Log("既有标签激活: UIA Select 失败(tab#" + idx + "),转新开标签");
+            Log("既有标签激活: UIA Select 失败(tab#" + idx + " cand=" + cand + "),下一候选/新开标签");
             return false;
         }
-        for (int i = 0; i < 10; i++) {                   // 标题核实,~2s
+        for (int i = 0; i < 10; i++) {                    // 标题核实,~2s
             string t = GetTitle(target);
             if (t == display || t.StartsWith(display + " 和 ") || t.StartsWith(display + " - ")) {
-                Log("既有标签激活: OK(tab#" + idx + " → " + path + ")");
+                Log("既有标签激活: OK(tab#" + idx + " → " + cand + ")");
                 return true;
             }
             Thread.Sleep(200);
         }
-        Log("既有标签激活: Select 已调用但标题未切换(当前: " + GetTitle(target) + "),转新开标签");
+        Log("既有标签激活: Select 已调用但标题未切换(当前: " + GetTitle(target) + "),下一候选/新开标签");
         return false;
+    }
+
+    /// <summary>读某资源管理器窗口当前选中项的第一条完整路径(/select 打开的窗口里即
+    /// 被 reveal 的目录或文件;普通窗口返回 null)。读不到不致命:候选退化为容器路径。</summary>
+    private static string GetSelectedPath(IntPtr hwnd) {
+        try {
+            Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+            dynamic shellWindows = Activator.CreateInstance(t);
+            try {
+                foreach (dynamic w in shellWindows) {
+                    bool mine = false;
+                    string result = null;
+                    try {
+                        mine = new IntPtr(Convert.ToInt64(w.HWND)) == hwnd;
+                        if (mine) {
+                            dynamic items = w.Document.SelectedItems();
+                            if (items != null) {
+                                foreach (dynamic it in items) {
+                                    try {
+                                        string p = (string)it.Path;
+                                        if (!string.IsNullOrEmpty(p)) { result = p; break; }
+                                    } catch {
+                                    } finally {
+                                        try { Marshal.ReleaseComObject(it); } catch { }
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                    } finally {
+                        try { Marshal.ReleaseComObject(w); } catch { }
+                    }
+                    if (mine) return result;
+                }
+            } finally {
+                try { Marshal.ReleaseComObject(shellWindows); } catch { }
+            }
+        } catch {
+        }
+        return null;
     }
 
     /// <summary>hwnd 名下 tab 序列中,比对路径 == path 的第一条的索引(0-based);无则 -1。
