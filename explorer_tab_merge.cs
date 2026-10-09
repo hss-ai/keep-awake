@@ -143,6 +143,9 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private bool disposed;
     // 键盘注入互斥门:多个合并线程同时进键盘兜底会互相打乱对方的按键序列
     private static readonly object KeyboardGate = new object();
+    // 合并闸门(v1.4.8):explorer 单进程 STA,并发多路跨进程操控实测把它压到栈溢出
+    // 崩溃/连续 AppHang,操控段必须全局串行
+    private static readonly object MergeGate = new object();
 
     public ExplorerTabMerger() {
         hookProc = OnWinEvent;
@@ -264,8 +267,32 @@ internal sealed class ExplorerTabMerger : IDisposable {
 
         IntPtr target = FindTargetWindow(newHwnd);
         if (target == IntPtr.Zero) { Log("无既有窗口,保留为首窗"); return; }
-        Log("合并前标签快照: " + TabsSnapshot(target));
 
+        // v1.4.8 合并闸门:同一时刻只允许一个作业对 explorer 做操控(UIA/COM 写/键盘)。
+        // 此前每窗口一线程并发,连开几窗 = 多路跨进程操控同时压向单进程 STA 的 explorer,
+        // 实测直接压垮:2026-10-09 15:01 四窗并发合并期 explorer 栈溢出崩溃(0xC00000FD),
+        // 16:07/16:08 用户场景 explorer 已无响应后仍各起一路 → 连续两次 AppHang 被杀重启。
+        // 串行后单窗无变化;连开多窗排队执行(每作业内部调用全有超时,最坏 ~1min 出闸,
+        // 不会退化回 v1.4.0 之前"一个挂死堵全部"的老问题)
+        bool gate = Monitor.TryEnter(MergeGate, 90000);
+        if (!gate) {
+            Log("合并闸门等待超时(前序合并未完成),本窗口保留");
+            return;
+        }
+        try {
+        string snap = TabsSnapshot(target);
+        Log("合并前标签快照: " + snap);
+        // 快照拿不到(超时)或拿到空串(枚举活着但目标窗口一条标签都没报——半死态,
+        // 2026-10-09 并发实测出现过)= explorer 已无响应/状态混乱。此刻任何后续操控
+        //(UIA 查找、更别说 AttachThreadInput 挂它的线程再注入键盘)都是火上浇油,
+        // 只会把它推去崩溃重启(16:07 实锤)。保留窗口,等 explorer 缓过来
+        if (snap.Length == 0 || snap == "(COM超时)") {
+            Log("explorer COM 无响应或状态异常(快照=" + (snap.Length == 0 ? "空" : "超时")
+                + "),放弃合并(窗口保留,待其恢复)");
+            return;
+        }
+
+        bool comDead = false;   // NavigateNewTab 内 COM 基线拿不到 → 键盘兜底也必须跳过
         bool merged = false;
         if (path.Length > 0 && ActivateExistingTab(target, path, newHwnd)) {
             // 目标路径已是既有窗口里的某条标签:直接激活它,不再开重复标签
@@ -275,25 +302,25 @@ internal sealed class ExplorerTabMerger : IDisposable {
         }
         if (!merged && path.Length > 0) {
             // 首选:Shell COM Navigate2(navOpenInNewTab)——零按键:不经前台、不吃输入法、不抢焦点
-            if (NavigateNewTab(target, path)) {
+            if (NavigateNewTab(target, path, out comDead)) {
                 for (int i = 0; i < 10 && !TabExistsInWindow(target, path); i++) Thread.Sleep(200);
                 merged = TabExistsInWindow(target, path);
                 Log("COM 新标签导航: " + (merged ? "OK" : "已调用但标签未到位"));
             } else {
-                Log("COM Navigate2 调用失败");
+                Log("COM Navigate2 调用失败" + (comDead ? "(COM 无响应,跳过键盘兜底)" : ""));
             }
         }
 
-        if (!merged && path.Length > 0 && !path.StartsWith("::")) {
+        if (!merged && !comDead && path.Length > 0 && !path.StartsWith("::")) {
             // 兜底:键盘注入(前台确认→Ctrl+T→Ctrl+L 输入路径;IME 摘除+重试+剪贴板粘贴)。
             // 虚拟位置(::{GUID})不走键盘:实测打 GUID 进地址栏不生效,还会给目标窗口
             // 堆一堆默认标签;COM 的 Navigate2 在本进程内又会间歇性无限挂起(2026-10-04,
             // pwsh 里同调用正常,疑 C# dynamic/套间交互,待挂起线程抓栈定位)——
             // GUID 合并只赌 COM 一把,失败保窗不丢位置(v1.4.0 一刀切主页的严格改进)。
             // 整段过 KeyboardGate:两个合并线程同时打字会互相打断对方的按键序列
-            bool gate = Monitor.TryEnter(KeyboardGate, 5000);
+            bool kbGate = Monitor.TryEnter(KeyboardGate, 5000);
             try {
-                if (!gate) {
+                if (!kbGate) {
                     Log("键盘兜底:互斥门等待超时(另一合并正在注入),放弃");
                 } else if (BringToFrontVerified(target)) {
                     SendCtrlCombo(VK_T);
@@ -316,16 +343,16 @@ internal sealed class ExplorerTabMerger : IDisposable {
                     Log("无法把目标窗口置前,跳过键盘兜底");
                 }
             } finally {
-                if (gate) Monitor.Exit(KeyboardGate);
+                if (kbGate) Monitor.Exit(KeyboardGate);
             }
         }
 
         if (!merged && path.Length == 0) {
             // 虚拟位置读不到命名空间路径:Ctrl+T 新标签默认就落在主页,与被并窗口一致。
             // 同样要注入按键,过 KeyboardGate
-            bool gate = Monitor.TryEnter(KeyboardGate, 5000);
+            bool kbGate = Monitor.TryEnter(KeyboardGate, 5000);
             try {
-                if (!gate) {
+                if (!kbGate) {
                     Log("主页标签:键盘互斥门等待超时,放弃");
                 } else if (BringToFrontVerified(target)) {
                     SendCtrlCombo(VK_T);
@@ -336,7 +363,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
                     Log("虚拟文件夹但无法置前,放弃");
                 }
             } finally {
-                if (gate) Monitor.Exit(KeyboardGate);
+                if (kbGate) Monitor.Exit(KeyboardGate);
             }
         }
 
@@ -353,6 +380,9 @@ internal sealed class ExplorerTabMerger : IDisposable {
         ShowTargetToUser(target);                // 还原最小化 + 尽力带到眼前(不注入按键)
         Log("并入完成 " + target + (path.Length == 0 ? "(主页标签)" : " → " + path)
             + " 最终最小化=" + IsIconic(target) + " 合并后标签快照: " + TabsSnapshot(target));
+        } finally {
+            Monitor.Exit(MergeGate);
+        }
     }
 
     /// <summary>合并完成后把目标窗口带回用户眼前:最小化则还原(还原自带激活);
@@ -389,10 +419,12 @@ internal sealed class ExplorerTabMerger : IDisposable {
     /// 一律原地导航——会把既有标签顶掉(v1.2.1 之前「老目录被关掉」的真凶)。
     /// 可靠组合:UIA 调用标签栏 AddButton 开出真新标签(落在主页,LocationURL 为空),
     /// 再对这条新增的空标签原地 Navigate2 到目标路径。全程零键盘:不吃输入法、不依赖前台。</summary>
-    private static bool NavigateNewTab(IntPtr targetHwnd, string path) {
+    private static bool NavigateNewTab(IntPtr targetHwnd, string path, out bool comDead) {
+        comDead = false;
         int emptyBefore = ComCall(2000, delegate() { return CountEmptyTabs(targetHwnd); }, -1);
         if (emptyBefore < 0) {
             Log("COM 无响应(空标签基线计数超时),放弃 COM 新标签");
+            comDead = true;                     // explorer 已无响应,键盘兜底也不许走
             return false;
         }
         // AddButton 的 UIA 查找/调用会间歇性失败,两种形态(2026-10-03/04 实测,v1.3.3 起就有):
@@ -440,6 +472,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
             int nowEmpty = ComCall(1500, delegate() { return CountEmptyTabs(targetHwnd); }, -1);
             if (nowEmpty < 0) {
                 Log("COM 无响应(空标签复点超时),放弃 COM 新标签");
+                comDead = true;
                 return false;
             }
             if (nowEmpty >= emptyBefore + 1) {
