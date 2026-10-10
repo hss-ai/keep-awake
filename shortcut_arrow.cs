@@ -10,13 +10,20 @@
 //   CLI 实例(--arrow on|off)干完写注册表+刷图标即退(与 --restore-power 同款套路)。
 // 图标:不依赖系统 DLL 里"恰好透明"的图标序号(教程里的 imageres.dll,197 之类随
 //   版本漂移,选错渲染成黑方块),运行时手写一张 16×16 全透明 ICO 到
-//   %LOCALAPPDATA%\KeepAwake\blank.ico。⚠暗坑(26300 实测):32bpp ICO 的 alpha
+//   %ProgramData%\KeepAwake\blank.ico。⚠暗坑(26300 实测):32bpp ICO 的 alpha
 //   若【全 0】,GDI 判"这图没有 alpha 通道",按 RGB 渲染成不透明黑方块——AND 掩码
 //   全 1 也救不了(这条渲染路径不读掩码;PIL 默认写的 PNG-entry ICO 同样黑)。
 //   正解:让一个像素 alpha=1 触发 alpha 合成,其余全 0 → 整图透明。
+//   放机器级共享目录(v1.4.10):"29" 写在 HKLM,全机器全用户生效,指向的路径必须
+//   任何账户都读得到——旧版放 %LOCALAPPDATA%(每用户),换账户登录/「标准用户+
+//   管理员凭据」提权(提权实例的 LOCALAPPDATA 是管理员账户的)都会指到别人目录,
+//   图标加载失败。ProgramData 对 Users 可读,提权实例可写,谁写都在同一处。
 // 可逆:开启前若发现 "29" 已被别的工具写过,原值备份到独立的 HKCU 配置键,
-//   关闭时还原——不顺手清掉别人的配置。(备份不放 Software\KeepAwake 下面:
+//   关闭时还原——不顺手清掉别人的配置;自家的值(v1.4.10 前的 %LOCALAPPDATA% 旧
+//   路径也认)关闭时直接删净。(备份不放 Software\KeepAwake 下面:
 //   电源护栏恢复完会把整个键删净,同键塞别的东西会让它的 DeleteSubKey 抛异常。)
+// 开关状态只认自家写的值:别的工具(Winaero 等)写的 "29" 不显示为勾选,用户点
+//   「关闭」也不动它——没经我们开启过的值,还原语义无从谈起。
 // 生效:分两层。注册表一写入,【新进程】立即按新图标合成(SHGetFileInfo/新开窗口
 //   都是新状态);但【桌面】由常驻多年的 Explorer 进程绘制,"29=箭头"映射与合成
 //   结果都缓存在该进程内——F5、ie4uinit、WM_SETTINGCHANGE、SHChangeNotify(
@@ -46,12 +53,14 @@ static class ShortcutArrowCleaner {
 
     // ==== 状态 ====
 
-    /// <summary>"29" 已被覆盖(小箭头已去除)吗?菜单勾选以此实况为准。</summary>
+    /// <summary>"29" 是本工具写的(小箭头已去除)吗?菜单勾选以此实况为准。
+    /// 只认自家路径(含旧版 %LOCALAPPDATA% 路径):别的工具写的 "29" 不算开——
+    /// 否则菜单显示勾选、用户点「关闭」会把别人的配置误删。</summary>
     public static bool IsEnabled() {
         try {
             using (var key = Registry.LocalMachine.OpenSubKey(ShellIconsPath)) {
                 if (key == null) return false;
-                return !string.IsNullOrEmpty(key.GetValue(ValueName) as string);
+                return IsOurIconValue(key.GetValue(ValueName) as string);
             }
         } catch {
             return false;
@@ -111,7 +120,9 @@ static class ShortcutArrowCleaner {
         using (var key = Registry.LocalMachine.CreateSubKey(ShellIconsPath)) {
             string prev = key.GetValue(ValueName) as string;
             if (on) {
-                if (!string.IsNullOrEmpty(prev) && prev != BlankIcoPath()) {
+                // 只备份「别的工具」写的值:自家的旧值(含旧版路径)不用备份,
+                // 关闭时直接删净即可——备份它会让「关闭」还原成自家旧路径,勾选状态来回打转
+                if (!string.IsNullOrEmpty(prev) && !IsOurIconValue(prev)) {
                     using (var cfg = Registry.CurrentUser.CreateSubKey(CfgPath))
                         cfg.SetValue(BackupName, prev, RegistryValueKind.String);
                 }
@@ -127,9 +138,12 @@ static class ShortcutArrowCleaner {
                     using (var cfg = Registry.CurrentUser.CreateSubKey(CfgPath))
                         cfg.DeleteValue(BackupName, false);
                     AppLog.Write("小箭头:已还原为覆盖前的原值(别的工具写的 29 交还)");
-                } else {
+                } else if (IsOurIconValue(prev)) {
                     key.DeleteValue(ValueName, false);
                     AppLog.Write("小箭头:已恢复系统默认(29 删净)");
+                } else {
+                    // 没经过我们开启、也没备份过的值:是别的工具的配置,不动它
+                    AppLog.Write("小箭头:29 是别的工具写的(" + prev + "),未动");
                 }
             }
         }
@@ -148,8 +162,20 @@ static class ShortcutArrowCleaner {
 
     public static string BlankIcoPath() {
         return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "KeepAwake", "blank.ico");
+    }
+
+    static string LegacyBlankIcoPath() {
+        // v1.4.10 之前写在每用户的 %LOCALAPPDATA%,文件本身无害(不删),
+        // 认它只为了让旧装机的开关状态/关闭操作继续正确
+        return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "KeepAwake", "blank.ico");
+    }
+
+    static bool IsOurIconValue(string v) {
+        return v == BlankIcoPath() || v == LegacyBlankIcoPath();
     }
 
     // 字节手写,构造与 tests/probe_arrow.py make_blank_ico() 一一对应,改一处改两处:

@@ -136,6 +136,10 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private readonly WinEventDelegate hookProc;          // 持引用防 GC 回收原生回调
     private readonly Thread worker;
     private readonly AutoResetEvent wakeup = new AutoResetEvent(false);
+    // pending(待处理)与 inFlight(合并中)共用 stateLock:出队与登记必须同一临界区——
+    // 分开锁的话,两步之间的空窗里该窗口两边都不在册,另一作业的 FindTargetWindow
+    // 会把它误当合并目标(正是 skip 名单要防的"A 并进排队中的 B"),窗口虽小但真丢标签
+    private readonly object stateLock = new object();
     private readonly Queue<IntPtr> pending = new Queue<IntPtr>();
     private readonly HashSet<IntPtr> inFlight = new HashSet<IntPtr>();   // 正在合并中的窗口
     private readonly Dictionary<IntPtr, DateTime> seen = new Dictionary<IntPtr, DateTime>();
@@ -185,7 +189,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
         if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero) return;
         var sb = new StringBuilder(64);
         if (GetClassName(hwnd, sb, 64) == 0 || sb.ToString() != ExplorerWindowClass) return;
-        lock (pending) { pending.Enqueue(hwnd); }
+        lock (stateLock) { pending.Enqueue(hwnd); }
         wakeup.Set();
     }
 
@@ -195,21 +199,23 @@ internal sealed class ExplorerTabMerger : IDisposable {
             if (disposed) break;
             while (true) {
                 IntPtr hwnd;
-                lock (pending) {
+                lock (stateLock) {
                     if (pending.Count == 0) break;
                     hwnd = pending.Dequeue();
+                    inFlight.Add(hwnd);   // 与出队同临界区:不让窗口出现两边都不在册的空窗
                 }
                 // 每个窗口的合并跑在独立线程:explorer 的 COM/UIA 都会间歇性无响应,
                 // 单线程串行时一个调用挂住就堵死整条队列(2026-10-04 实测挂过 3 分钟);
                 // 独立线程顶多这一个窗口不合并,后续窗口照常
-                lock (inFlight) { inFlight.Add(hwnd); }
                 Thread job = new Thread(delegate() {
                     try {
                         if (enabled) HandleNewWindow(hwnd);
-                    } catch {
-                        // 单个窗口处理异常不拖垮守护
+                    } catch (Exception ex) {
+                        // 单个窗口处理异常不拖垮守护;日志必须留——空吞的话合并悄悄
+                        // 放弃连诊断线索都没有
+                        Log("合并作业异常(窗口保留): " + ex);
                     } finally {
-                        lock (inFlight) { inFlight.Remove(hwnd); }
+                        lock (stateLock) { inFlight.Remove(hwnd); }
                     }
                 });
                 job.IsBackground = true;
@@ -802,6 +808,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
         } finally {
             try {
                 if (prev != null) System.Windows.Forms.Clipboard.SetText(prev);
+                else System.Windows.Forms.Clipboard.Clear();   // 用之前就是空的:清掉路径还他空剪贴板,别留下尾巴
             } catch {
             }
         }
@@ -929,8 +936,10 @@ internal sealed class ExplorerTabMerger : IDisposable {
         // B 随后又被当新窗口合并关掉,B 里 A 的标签就一起没了
         List<IntPtr> skip = new List<IntPtr>();
         skip.Add(exclude);
-        lock (pending) { foreach (IntPtr h in pending) skip.Add(h); }
-        lock (inFlight) { foreach (IntPtr h in inFlight) skip.Add(h); }
+        lock (stateLock) {
+            foreach (IntPtr h in pending) skip.Add(h);
+            foreach (IntPtr h in inFlight) skip.Add(h);
+        }
         IntPtr best = IntPtr.Zero;
         EnumWindows(delegate(IntPtr h, IntPtr l) {
             var sb = new StringBuilder(64);

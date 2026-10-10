@@ -107,6 +107,45 @@ def make_shortcut(exe_path: str, lnk_path: str) -> None:
         raise SystemExit("快捷方式创建失败")
 
 
+def source_version() -> str:
+    """版本号单一源头:keep_awake_tray.cs 启动日志行「启动(vX.Y.Z)」。
+
+    产物版本三处对齐全靠它——exe 的 AssemblyVersion/FileVersion(生成的
+    AssemblyInfo.cs)与内嵌 manifest 的 assemblyIdentity version(生成的副本,
+    仓库里的 app.manifest 保持 1.4.0.0 占位不动)。以前 manifest 静态 1.4.0.0
+    又没有 AssemblyInfo,exe 属性查不到版本、与启动日志各说各话。
+    """
+    import re
+    with open(os.path.join(HERE, "keep_awake_tray.cs"), encoding="utf-8") as f:
+        m = re.search(r"启动\(v(\d+\.\d+\.\d+)\)", f.read())
+    if not m:
+        raise SystemExit("keep_awake_tray.cs 里没找到『启动(vX.Y.Z)』版本行,版本号无从注入")
+    return m.group(1)
+
+
+def write_version_sources(version: str, asm_path: str, manifest_copy: str) -> None:
+    quad = version + ".0"
+    with open(asm_path, "w", encoding="utf-8", newline="\n") as f:
+        # 文件里有中文(AssemblyDescription);csc 走 /codepage:65001 编译,UTF-8 落盘即可
+        f.write(
+            "// 构建时生成(build_keep_awake.py):版本源头在 keep_awake_tray.cs 启动日志行\n"
+            'using System.Reflection;\n'
+            f'[assembly: AssemblyVersion("{quad}")]\n'
+            f'[assembly: AssemblyFileVersion("{quad}")]\n'
+            '[assembly: AssemblyTitle("KeepAwake")]\n'
+            '[assembly: AssemblyProduct("KeepAwake")]\n'
+            '[assembly: AssemblyDescription("防待机托盘工具")]\n'
+        )
+    with open(MANIFEST, encoding="utf-8") as f:
+        manifest = f.read()
+    import re
+    manifest, n = re.subn(r'version="\d+\.\d+\.\d+\.\d+"', f'version="{quad}"', manifest, count=1)
+    if n != 1:
+        raise SystemExit("app.manifest 里没找到 assemblyIdentity 的 version 属性,无法注入版本")
+    with open(manifest_copy, "w", encoding="utf-8", newline="\n") as f:
+        f.write(manifest)
+
+
 def main() -> int:
     build_only = "--build-only" in sys.argv
     for src_file in SRC_FILES:
@@ -124,13 +163,19 @@ def main() -> int:
     make_ico(ico)
     print(f"[1/4] 图标已生成:{ico}")
 
+    version = source_version()
+    asm_info = os.path.join(BUILD_DIR, "AssemblyInfo.cs")
+    manifest_out = os.path.join(BUILD_DIR, "app.manifest")
+    write_version_sources(version, asm_info, manifest_out)
+    print(f"[1.5/4] 版本注入:{version}(AssemblyInfo + manifest 副本)")
+
     compile_cmd = [
         CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
-        "/win32icon:" + ico, "/win32manifest:" + MANIFEST, "/out:" + out_exe,
+        "/win32icon:" + ico, "/win32manifest:" + manifest_out, "/out:" + out_exe,
         "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:Microsoft.CSharp.dll",
         "/r:" + find_gac_assembly("UIAutomationClient"),
         "/r:" + find_gac_assembly("UIAutomationTypes"),
-        *SRC_FILES,
+        *SRC_FILES, asm_info,
     ]
     result = subprocess.run(compile_cmd, capture_output=True)
     if result.returncode != 0 or not os.path.isfile(out_exe):

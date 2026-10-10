@@ -12,6 +12,12 @@
 //   → 窗口内无伴随 = 真左 Win:原样补发(仅 20ms 不可感知延迟;Win+D 等组合键
 //     的人类按压间隔 ≫20ms,不受影响),开始菜单/Win 快捷键照常。
 //   → 标准键盘的 0x5C(VK_RWIN)直映射保留:换键盘/别的机器发标准码时直接生效。
+//   → 迟到反悔(v1.4.9,用户实测"Win(右)→Ctrl(右)未生效"的根因):判定窗 25ms
+//     只比录音采样的 F23(+20ms)多几 ms 余量,无线链路批报/系统负载把伴随键拖过
+//     窗,右 Win 就被误判成真左 Win——弹开始菜单、右 Ctrl 不注入。补发的左 Win
+//     down 之后、物理 0x5B 还没抬的 250ms 内,F23 才到 = 迟到的三件套:抬掉补发
+//     的左 Win、补抬已直通出去的 Shift、改注右 Ctrl。反悔只认 F23(0x86 是人手
+//     不会按的机器码)——Shift 迟到可能是 Win+Shift+S 的人类组合,不能动。
 //
 // 机制(两条映射共用一个 WH_KEYBOARD_LL 钩子,各自独立开关):
 //   1) 低级钩子拦在全系统键盘流最前面,装在独立线程(自有 GetMessage 消息循环):
@@ -21,7 +27,8 @@
 //      F2 抬起:吞掉 → 抬起 W → 若 Ctrl 是我们补按的才一并抬起
 //      (用户自己按着的 Ctrl 绝不替他抬,松开后仍保持);
 //   3) 右侧 Win 键(三件套)按下:吞掉全部 → 若此刻 Ctrl 未按下则补按右 Ctrl;
-//      抬起:吞掉 → 补抬(同样是"自己按着的 Ctrl 不碰");
+//      抬起:吞掉 → 补抬(同样是"自己按着的 Ctrl 不碰")。判定窗超时已补发左 Win
+//      的,250ms 反悔宽限内 F23 才到就抬掉补发、改注右 Ctrl(见头注"迟到反悔");
 //   4) keyup 只在对应 keydown 是我们吞掉时才吞:按住原键期间开关状态翻转
 //      (如映射从关到开:keydown 直通、keyup 却被吞)会让修饰键缺 up 而粘键,
 //      系统从此认为 Win 一直按着、所有按键变 Win+ 组合——v1.4.3 修;
@@ -65,8 +72,11 @@ internal sealed class KeyRemapper : IDisposable {
     private const uint WM_APP_DECIDE = 0x8001;  // 判定线程 → 钩子线程:0x5B 判定窗到期
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;   // 扩展键(右 Ctrl/Win 键):扫描码带 E0 前缀的标志
     private const int VK_CONTROL = 0x11;      // GetAsyncKeyState 查的是"任一 Ctrl"
+    private const uint MAPVK_VK_TO_VSC = 0;   // MapVirtualKey:VK → 扫描码
     private const int PendingWindowMs = 25;       // 三件套伴随键的判定窗(实测 +10ms/+20ms 到达)
+    private const int LateGraceMs = 250;          // 补发左Win后的反悔宽限:迟到的 F23 仍可改判三件套
 
     private static readonly UIntPtr MagicExtra = new UIntPtr(0x4B415741); // "KAWA"
     private static readonly IntPtr MagicPtr = new IntPtr(0x4B415741);
@@ -85,6 +95,8 @@ internal sealed class KeyRemapper : IDisposable {
     private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")]
+    private static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll")]
     private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
     [DllImport("user32.dll")]
@@ -142,6 +154,9 @@ internal sealed class KeyRemapper : IDisposable {
     private bool rwinWeCtrl;    // 标准右 Win 映射补按的 Ctrl 还欠抬起
     // 三件套状态机(键盘右侧 Win 合成键)
     private bool lwinPending;   // 0x5B down 已暂扣,判定窗内(等待伴随键或判定线程到期)
+    private bool lwinReplayed;  // 判定窗超时已补发左 Win down,物理 0x5B 未抬(反悔宽限存活)
+    private bool graceStrayShift;  // 反悔宽限期内直通出去的 Shift(反悔时补抬,防悬挂)
+    private int lwinDownTick;   // 0x5B 按下的 TickCount(反悔宽限计时;int 回绕用不检查减法)
     private bool trioActive;    // 判定为三件套:0x5B 吞着,后续 0xA0/0x86 伴随键也吞
     private bool trioWeCtrl;    // 三件套映射补按的右 Ctrl 还欠抬起
 
@@ -291,16 +306,23 @@ internal sealed class KeyRemapper : IDisposable {
     // 三件套起手键 0x5B:键盘右侧那个键(合成 5B+A0+86)与真·左 Win(裸 5B)的岔路口。
     // down 先暂扣,判定窗(~25ms,判定线程计时)内出现伴随键 = 右侧键(转 HandleTrioSide 判定);
     // 窗口超时 = 真左 Win,OnPendingTimeout 里原样补发(魔数),up 直通与之配对。
+    // 补发之后还有一道反悔宽限:物理 0x5B 没抬的 250ms 内 F23 才到 = 迟到的三件套
+    // (HandleTrioSide 反悔分支抬掉补发、改注右 Ctrl),专治无线链路批报把伴随键
+    // 拖过 25ms 窗(用户实测"Win(右)→Ctrl(右)未生效"的根因)。
     private bool HandleTrioLWin(bool downMsg, bool upMsg) {
         if (downMsg) {
             if (!winEnabled) return false;
             if (trioActive) return true;        // 长按右侧键:0x5B 自动重复,直接吞
-            if (lwinPending) {
-                // 极速连按(上一发的判定还在途):三件套的 5B 不会这么快重复,
-                // 坐实上一发是纯左 Win,先补发它的 down,再暂扣本发
-                SendKey(VkLWin, false);
-            }
-            lwinPending = true;                 // 暂扣,等伴随键或判定窗到期
+            // 已补发过左 Win(物理还没抬):此刻的 5B down 只能是同一键的自动重复——
+            // 补发的 down 已代表按住态,直接吞。让它再进 pending 的话判定线程会周期性
+            // 重发 down、不断刷新反悔宽限起点(v1.4.10 修)
+            if (lwinReplayed) return true;
+            // 窗口内又来一发 5B:物理上只可能是同一键的自动重复(单键 25ms 内按不出两次),
+            // 只吞不补发。旧代码在这里补发 down——固件偶发重发 5B↓ 去抖时,那个 down
+            // 没有配对的 up(物理 up 随后被三件套激活吞掉),左 Win 永久粘住(v1.4.9 修)
+            lwinPending = true;
+            lwinDownTick = Environment.TickCount;
+            graceStrayShift = false;
             decideSignal.Set();
             return true;
         }
@@ -314,11 +336,15 @@ internal sealed class KeyRemapper : IDisposable {
                 // 成对补发 down+up(魔数)再吞掉物理 up。⚠不能只补 down 放行物理 up:
                 // 注入的新事件要排在本事件之后走链,系统会先收到 up 后收到 down(错序粘键)
                 lwinPending = false;
+                lwinReplayed = false;
                 SendKey(VkLWin, false);
                 SendKey(VkLWin, true);
                 return true;
             }
-            return false;                       // 真左 Win 的 up:直通(与补发的 down 配对)
+            // 真左 Win 的 up:直通(与补发的 down 配对);反悔宽限到此为止
+            lwinReplayed = false;
+            graceStrayShift = false;
+            return false;
         }
         return false;
     }
@@ -331,18 +357,53 @@ internal sealed class KeyRemapper : IDisposable {
             // 坐实三件套:0x5B 的暂扣转为吞,注入右 Ctrl(用户自己按着的 Ctrl 不碰)
             lwinPending = false;
             trioActive = true;
+            graceStrayShift = false;
             trioWeCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0;
             if (trioWeCtrl) SendKey(VkRCtrl, false);
+            AppLog.Write("键映射:三件套坐实(伴随键 0x" + vk.ToString("X2") + " +"
+                         + (Environment.TickCount - lwinDownTick) + "ms 到达),注入右Ctrl");
             return true;
+        }
+        // 反悔宽限:判定窗超时后已补发左 Win down,但物理 0x5B 还没抬——迟到的三件套。
+        // F23(人手不会按的机器码)才到 = 坐实右侧键;Shift 迟到只记账不动作(可能是
+        // Win+Shift+S 人类组合,它的 up 直通与之配对,不动它)。
+        bool inGrace = lwinReplayed && Environment.TickCount - lwinDownTick <= LateGraceMs;
+        if (downMsg && inGrace) {
+            if (vk == VkF23) {
+                // 抬掉补发的左 Win(开始菜单收起)、补抬宽限期内直通出去的 Shift
+                // (它的 up 随后被 trioActive 吞,不补抬就悬挂)、改注右 Ctrl
+                lwinReplayed = false;
+                trioActive = true;
+                trioWeCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0;
+                SendKey(VkLWin, true);
+                if (graceStrayShift) { SendKey(VkLShift, true); graceStrayShift = false; }
+                if (trioWeCtrl) SendKey(VkRCtrl, false);
+                AppLog.Write("键映射:三件套迟到反悔(F23 +"
+                             + (Environment.TickCount - lwinDownTick)
+                             + "ms 才到,过 25ms 判定窗),抬补发左Win、改注右Ctrl");
+                return true;
+            }
+            if (vk == VkLShift) {
+                graceStrayShift = true;   // 直通出去;若稍后 F23 反悔,补抬它
+                return false;
+            }
+        }
+        if (upMsg && vk == VkLShift && graceStrayShift) {
+            graceStrayShift = false;      // 直通的 Shift 自己抬了:与直通的 down 配对
+            return false;
         }
         return false;   // 与三件套无关的 Shift/F23(用户打字等):原样直通
     }
 
     // 0x5B 判定窗到期(判定线程投递的 WM_APP_DECIDE):真·左 Win,原样补发。
+    // 补发后进入反悔宽限(LateGraceMs):物理 0x5B 未抬的窗口内 F23 才到 = 迟到的
+    // 三件套,由 HandleTrioSide 反悔分支抬掉这里的补发、改注右 Ctrl。
     private void OnPendingTimeout() {
         if (!lwinPending) return;
         lwinPending = false;
+        lwinReplayed = true;
         SendKey(VkLWin, false);
+        AppLog.Write("键映射:左Win判定窗超时,原样补发左Win(反悔宽限 " + LateGraceMs + "ms)");
     }
 
     /// <summary>抬起 F2 映射注入且尚未抬起的键(仅钩子线程调用)。</summary>
@@ -371,7 +432,13 @@ internal sealed class KeyRemapper : IDisposable {
         INPUT[] one = new INPUT[1];
         one[0].Type = INPUT_KEYBOARD;
         one[0].U.Ki.Vk = vk;
-        one[0].U.Ki.Flags = up ? KEYEVENTF_KEYUP : 0;
+        // 扫描码+扩展位补齐(v1.4.10):只填 VK 时按 VK 消费的应用没问题,但远程桌面/
+        // 虚拟机/部分游戏走扫描码路径——右 Ctrl(0xA3)与左 Ctrl 扫描码同为 0x1D,靠
+        // E0 前缀区分;不带 KEYEVENTF_EXTENDEDKEY 会被它们认成左 Ctrl。左右 Win 键
+        // 物理上同样是 E0 扩展键。走 VK 路径的应用不受影响(标志只加 E0,VK 原样)。
+        one[0].U.Ki.Scan = (ushort)MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+        bool extended = vk == VkRCtrl || vk == VkLWin || vk == VkRWin;
+        one[0].U.Ki.Flags = (up ? KEYEVENTF_KEYUP : 0) | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
         one[0].U.Ki.ExtraInfo = MagicExtra;
         SendInput(1, one, Marshal.SizeOf(typeof(INPUT)));
     }

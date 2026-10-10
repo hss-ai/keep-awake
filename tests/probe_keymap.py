@@ -22,7 +22,15 @@
   H) 纯左 Win:Tap 0x5B → [LWIN↓T, LWIN↓K(20ms 判定超时后原样补发), LWIN↑T]
      (之后注入 ESC 清掉弹出的开始菜单,不在断言内);
   I) 三件套 + 外部按着 Ctrl:→ 坐实但不注入、不替外部抬;
-  J) 三件套长按(整体重复形态 ×3):→ 只产出一次 Ctrl 按压对。
+  J) 三件套长按(整体重复形态 ×3):→ 只产出一次 Ctrl 按压对;
+  K) 三件套整体迟到(a0=+80ms f23=+100ms,过 25ms 判定窗,v1.4.9 回归):
+     → 超时先补发左Win,F23 在 250ms 反悔宽限内到达:抬补发、补抬直通的 Shift、
+       改注右Ctrl(用户实测"Win(右)→Ctrl(右)未生效"的根因场景);
+  L) 三件套重度迟到(a0=+150ms f23=+200ms,宽限内):→ 同 K 反悔改判;
+  M) 三件套迟到超宽限(a0=+400ms f23=+500ms):→ 判真左Win,补发 down 由物理 up
+       直通配对,无任何目标键注入(设计边界,不再反悔);
+  N) 真左Win 长按(v1.4.10 回归):超时补发后的自动重复 down 全吞(录音链头仍可见),
+     不再周期性重发 down;物理 up 直通配对(ESC 清开始菜单)。
 清理:杀被测 exe → 恢复已装版本。
 """
 import ctypes
@@ -313,6 +321,36 @@ def trio_tap(repeats=1):
     send_key(VK_LWIN, up=True)
 
 
+def trio_late(a0_delay, f23_delay):
+    """三件套,伴随键延迟可调(ms):模拟无线链路批报/负载把伴随键拖过 25ms 判定窗。
+    延迟取值须明显大于判定窗最坏触发时刻(~25ms+sleep 抖动,取 ≥80ms 才确定),
+    又明显小于 250ms 反悔宽限(取 ≤200ms 才确定),落到区间中段。"""
+    send_key(VK_LWIN)
+    time.sleep(a0_delay / 1000.0)
+    send_key(VK_LSHIFT)
+    time.sleep(max(f23_delay - a0_delay, 0) / 1000.0)
+    send_key(VK_F23)
+    time.sleep(0.05)
+    send_key(VK_F23, up=True)
+    time.sleep(0.01)
+    send_key(VK_LSHIFT, up=True)
+    time.sleep(0.01)
+    send_key(VK_LWIN, up=True)
+
+
+def lwin_hold():
+    """真左 Win 长按(v1.4.10 回归):第一发 down 判定超时补发后,系统自动重复的
+    后续 down 必须直接吞——不再重新暂扣/周期性重发 down。SendInput 不产生系统
+    自动重复,连发 down 模拟之;收尾 ESC 清掉弹出的开始菜单。"""
+    send_key(VK_LWIN)
+    time.sleep(0.5)       # 判定窗(25ms)早已超时、补发已出
+    send_key(VK_LWIN)     # 模拟自动重复 ↓
+    time.sleep(0.05)
+    send_key(VK_LWIN)     # 再一发重复 ↓
+    time.sleep(0.05)
+    send_key(VK_LWIN, up=True)
+
+
 # 每场景的注入脚本。B/E/I 用外部 Ctrl 的按下/抬起包住原键按压,验证"不重复补按、不替外部抬"。
 SCENARIOS = [
     ("A", lambda: tap(VK_F2)),
@@ -346,6 +384,10 @@ SCENARIOS = [
         time.sleep(0.05),
         send_key(VK_LCONTROL, up=True))),
     ("J", lambda: trio_tap(3)),
+    ("K", lambda: (trio_late(80, 100), time.sleep(0.3), tap(VK_ESCAPE))),   # 迟到过窗:反悔改判(v1.4.9)
+    ("L", lambda: (trio_late(150, 200), time.sleep(0.3), tap(VK_ESCAPE))),  # 重度迟到,宽限内:反悔改判
+    ("M", lambda: (trio_late(400, 500), time.sleep(0.3), tap(VK_ESCAPE))),  # 迟到超宽限:判真左Win,ESC 清开始菜单
+    ("N", lambda: (lwin_hold(), time.sleep(0.3), tap(VK_ESCAPE))),          # 长按左Win:重复↓全吞(v1.4.10)
 ]
 
 # 录音序列期望。T=测试注入的原键(录音钩子在链头先于 KeepAwake,原键可见);
@@ -355,6 +397,12 @@ _QUAD_END = [("up", "W", "K"), ("up", "C", "K")]               # F2↑ 触发的
 _TRIO_HEAD = [("down", "LWIN", "T"), ("down", "SH", "T")]      # 三件套头两件(5B↓,A0↓)
 _TRIO_TAIL = [("up", "F23", "T"), ("up", "SH", "T"), ("up", "LWIN", "T")]  # 抬起三连
 _TRIO_REP = [("down", "LWIN", "T"), ("down", "SH", "T"), ("down", "F23", "T")]  # 一组重复
+# K/L(迟到的三件套→反悔):25ms 窗超时先补发左Win(K),直通的 Shift(T)在宽限期内
+# 等来 F23(T)→ 抬补发(K LWIN↑)、补抬 Shift(K SH↑)、改注右Ctrl(K C↓);三件 up
+# 全吞、5B↑ 还账(K C↑)
+_TRIO_LATE = [("down", "LWIN", "T"), ("down", "LWIN", "K"), ("down", "SH", "T"),
+              ("down", "F23", "T"), ("up", "LWIN", "K"), ("up", "SH", "K"),
+              ("down", "C", "K")] + _TRIO_TAIL + [("up", "C", "K")]
 EXPECTED = {
     "A": [("down", "F2", "T")] + _QUAD_MID + [("up", "F2", "T")] + _QUAD_END,
     "B": [("down", "C", "T"), ("down", "F2", "T"), ("down", "W", "K"),
@@ -378,6 +426,17 @@ EXPECTED = {
     # J:整体重复 ×3 → 只第一组注入一次 Ctrl 按压
     "J": _TRIO_HEAD + [("down", "C", "K"), ("down", "F23", "T")] + _TRIO_REP * 2
          + _TRIO_TAIL + [("up", "C", "K")],
+    # K/L:伴随键迟到过判定窗,250ms 反悔宽限内 F23 到达 → 抬补发、改注右Ctrl
+    "K": _TRIO_LATE,
+    "L": _TRIO_LATE,
+    # M:迟到超宽限 → 判真左Win:补发 down 由物理 up 直通配对,无目标键注入
+    "M": [("down", "LWIN", "T"), ("down", "LWIN", "K"), ("down", "SH", "T"),
+          ("down", "F23", "T")] + _TRIO_TAIL,
+    # N:长按左Win(v1.4.10):判定超时补发(K)后的自动重复 down 全吞(录音在链头仍可见 T),
+    # 不再各触发一次补发;物理 up 直通配对。旧行为会录出 T↓K↓T↓K↓T↓K↓T↑(每发重复
+    # 重复补发)——本断言正是与其区分
+    "N": [("down", "LWIN", "T"), ("down", "LWIN", "K"), ("down", "LWIN", "T"),
+          ("down", "LWIN", "T"), ("up", "LWIN", "T")],
 }
 
 # 破坏性场景:输出含真实 W 键,必须由探针窗体持有前台(安全目的地)才允许注入。

@@ -211,7 +211,8 @@ static class PowerHibernateGuard {
     }
 
     static void Restore() {
-        Guid scheme = ActiveScheme();
+        Guid active = ActiveScheme();   // 用户此刻正在用的方案:恢复全程不得替他切换选择
+        Guid scheme = active;           // 要写回原值的方案(备份时的那个,见下)
         using (var key = Registry.CurrentUser.OpenSubKey(RegPath, true)) {
             uint ac = Convert.ToUInt32(key.GetValue("HibernateIdleAcBackup", 0));
             object dcRaw = key.GetValue("HibernateIdleDcBackup");
@@ -221,15 +222,19 @@ static class PowerHibernateGuard {
                 Guid stored = new Guid((string)schemeRaw);
                 if (stored != Guid.Empty && SchemeExists(stored)) scheme = stored;
             }
-            key.SetValue("GuardPending", 0, RegistryValueKind.DWord);
             WriteVal(true, scheme, ac);
             if (dcRaw != null) {
                 // v1.3.0 曾把直流也归零:迁移场景把直流恢复一次并清掉旧键
                 WriteVal(false, scheme, Convert.ToUInt32(dcRaw));
                 key.DeleteValue("HibernateIdleDcBackup");
             }
+            // GuardPending 必须在【全部写入成功之后】才撤:先撤的话,上面任何一步抛异常,
+            // 下次启动 Pending()=false 不再自愈,备份从此死在注册表里,方案永久停在「从不」
+            key.SetValue("GuardPending", 0, RegistryValueKind.DWord);
         }
-        Guid s = scheme;
+        // 重新应用【用户当前】的方案(刷新立即生效)。⚠不能 reapply 写回的 scheme:
+        // 防待机期间用户切了方案的话,那会把用户硬切回旧方案——他只是开了个防待机而已
+        Guid s = active;
         PowerSetActiveScheme(IntPtr.Zero, ref s);
         Registry.CurrentUser.DeleteSubKey(RegPath, false);   // 恢复完毕,配置键删净
     }
@@ -257,7 +262,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.8)");
+        AppLog.Write("启动(v1.4.10)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -406,40 +411,50 @@ internal sealed class TrayContext : ApplicationContext {
 
     // 切换要写 HKLM:自我提权拉一次性 --arrow 实例,UAC 弹一次(这是本工具唯一
     // 需要管理员的瞬间,常驻与其它功能照旧免管理员)。
+    // SetEnabled 里 WaitForExit(120000) 同步等 UAC 结果:必须跑在后台线程——UI 线程
+    // 是 WinEvent 合并钩子的宿主,UAC 弹窗没被点期间它一挂就是两分钟,合并窗口全错过;
+    // 提权完成后经 UI 线程的同步上下文 Post 回去再碰菜单/弹问句(跨线程 WinForms 滥用)。
     // 桌面生效需重启资源管理器:常驻 Explorer 把「29=箭头」映射缓存在进程里,
     // F5/图标缓存通知全刷不动(26300 实测)——弹问句代办,并快照还原已开文件夹。
     void OnToggleArrow(object sender, EventArgs e) {
         bool want = !miArrow.Checked;
-        bool ok = false;
-        try {
-            ok = ShortcutArrowCleaner.SetEnabled(want);
-        } catch (Exception ex) {
-            AppLog.Write("小箭头切换异常: " + ex.Message);
-        }
-        miArrow.Checked = ShortcutArrowCleaner.IsEnabled(); // 以注册表实况为准(同开机自启)
-        if (!ok) {
-            tray.BalloonTipTitle = "去除快捷方式小箭头";
-            tray.BalloonTipText = "需要管理员权限(写 HKLM 注册表),UAC 被取消或未确认,本次未修改。";
-            tray.ShowBalloonTip(2500);
-            return;
-        }
-        if (DialogResult.Yes == MessageBox.Show(
-                "已写入注册表。\n\n桌面上的生效需要重启资源管理器(任务栏与桌面会闪几秒),"
-                + "已打开的文件夹窗口会自动还原成标签页。\n\n现在重启吗?\n(选「否」:下次开机后自然生效)",
-                "去除快捷方式小箭头", MessageBoxButtons.YesNo, MessageBoxIcon.Question)) {
-            System.Threading.Tasks.Task.Run((Action)delegate {
-                try {
-                    ShortcutArrowCleaner.RestartExplorerAndRestoreFolders();
-                } catch (Exception ex) {
-                    AppLog.Write("小箭头:资源管理器重启失败: " + ex.Message);
+        miArrow.Enabled = false;   // 防重入:后台等待期间再点一次会拉起两个提权实例
+        var ui = System.Threading.SynchronizationContext.Current;   // ApplicationContext 非 Control 无 BeginInvoke,靠同步上下文回 UI 线程
+        System.Threading.Tasks.Task.Run((Action)delegate {
+            bool ok = false;
+            try {
+                ok = ShortcutArrowCleaner.SetEnabled(want);
+            } catch (Exception ex) {
+                AppLog.Write("小箭头切换异常: " + ex.Message);
+            }
+            ui.Post(delegate(object s) {
+                miArrow.Enabled = true;
+                miArrow.Checked = ShortcutArrowCleaner.IsEnabled(); // 以注册表实况为准(同开机自启)
+                if (!ok) {
+                    tray.BalloonTipTitle = "去除快捷方式小箭头";
+                    tray.BalloonTipText = "需要管理员权限(写 HKLM 注册表),UAC 被取消或未确认,本次未修改。";
+                    tray.ShowBalloonTip(2500);
+                    return;
                 }
-            });
-        }
-        tray.BalloonTipTitle = "去除快捷方式小箭头";
-        tray.BalloonTipText = miArrow.Checked
-            ? "已去除。桌面在资源管理器重启后生效(刚才询问过;未重启则下次开机生效)。"
-            : "已恢复系统默认小箭头。桌面在资源管理器重启/下次开机后回到默认。";
-        tray.ShowBalloonTip(2500);
+                if (DialogResult.Yes == MessageBox.Show(
+                        "已写入注册表。\n\n桌面上的生效需要重启资源管理器(任务栏与桌面会闪几秒),"
+                        + "已打开的文件夹窗口会自动还原成标签页。\n\n现在重启吗?\n(选「否」:下次开机后自然生效)",
+                        "去除快捷方式小箭头", MessageBoxButtons.YesNo, MessageBoxIcon.Question)) {
+                    System.Threading.Tasks.Task.Run((Action)delegate {
+                        try {
+                            ShortcutArrowCleaner.RestartExplorerAndRestoreFolders();
+                        } catch (Exception ex) {
+                            AppLog.Write("小箭头:资源管理器重启失败: " + ex.Message);
+                        }
+                    });
+                }
+                tray.BalloonTipTitle = "去除快捷方式小箭头";
+                tray.BalloonTipText = miArrow.Checked
+                    ? "已去除。桌面在资源管理器重启后生效(刚才询问过;未重启则下次开机生效)。"
+                    : "已恢复系统默认小箭头。桌面在资源管理器重启/下次开机后回到默认。";
+                tray.ShowBalloonTip(2500);
+            }, null);
+        });
     }
 
     // ==== 开机自启(HKCU Run,免管理员) ====
