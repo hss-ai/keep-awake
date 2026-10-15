@@ -14,7 +14,7 @@
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
 //       Keyboard Manager;两条映射各自独立开关。Win(右)含三件套识别:用户
 //       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
-//       20ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
+//       25ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
 //     ✔启动时静音(每次进程真正跑起来——手动双击或开机自启——都把默认播放设备
 //       SetMute 静音:幂等"设置"非切换、不改音量值,取消静音即恢复原音量;
@@ -31,6 +31,7 @@
 //   托盘右键菜单会按 96 DPI 布局直接按物理像素渲染——字体缩成 9pt*(96/168)(v1.3.3 修)。
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -262,7 +263,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.10)");
+        AppLog.Write("启动(v1.4.11)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -322,8 +323,11 @@ internal sealed class TrayContext : ApplicationContext {
         timer.Start();
 
         merger = new ExplorerTabMerger();
-        miExplorer.Checked = true; // 默认开启:新开的资源管理器并入既有窗口
-        merger.Enabled = true;
+        // v1.4.11 Win11 闸:Win10/无标签页系统整功能停用——那边 AddButton 永远找不到,
+        // 键盘兜底的 Ctrl+L 会把既有窗口当前视图导航走(审查 C1),默认开改为「有能力才开」
+        miExplorer.Checked = ExplorerTabMerger.OsSupportsTabs();
+        merger.Enabled = miExplorer.Checked;
+        if (!miExplorer.Checked) AppLog.Write("资源管理器合并:系统无标签页能力(Win10?),已停用");
 
         remapper = new KeyRemapper();
         miKeymapF2.Checked = true;    // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
@@ -382,6 +386,14 @@ internal sealed class TrayContext : ApplicationContext {
     }
 
     void OnToggleExplorer(object sender, EventArgs e) {
+        if (!miExplorer.Checked && !ExplorerTabMerger.OsSupportsTabs()) {
+            // Win10 上尝试开启:说明原因而不是静默无效(v1.4.11;此前 README 写「开关无效
+            // 但不报错」,实际那边会走键盘兜底搞破坏,现在从入口拦住)
+            tray.BalloonTipTitle = "资源管理器单窗口合并";
+            tray.BalloonTipText = "此功能依赖 Windows 11 资源管理器原生标签页,当前系统不支持,无法开启。";
+            tray.ShowBalloonTip(2500);
+            return;
+        }
         miExplorer.Checked = !miExplorer.Checked;
         merger.Enabled = miExplorer.Checked;
     }
@@ -436,13 +448,43 @@ internal sealed class TrayContext : ApplicationContext {
                     tray.ShowBalloonTip(2500);
                     return;
                 }
+                // v1.4.11 问句按实况组文案:①合并器关着时还原是一堆独立窗口,不能再承诺
+                // 「还原成标签页」(merge-side-3);②检测到进行中的文件复制/移动先警示
+                // ——taskkill /f 会连着 explorer.exe 里的进度窗一起中断(审查 C5)
+                string restoreNote = miExplorer.Checked
+                    ? "已打开的文件夹窗口会自动还原成标签页。"
+                    : "已打开的文件夹窗口会逐一重新打开(合并功能当前未开启,将是独立窗口)。";
+                string opWarn = ShortcutArrowCleaner.HasRunningFileOperations()
+                    ? "\n⚠ 检测到正在进行的文件复制/移动操作——重启资源管理器会把它中断,建议先等它完成。"
+                    : "";
                 if (DialogResult.Yes == MessageBox.Show(
                         "已写入注册表。\n\n桌面上的生效需要重启资源管理器(任务栏与桌面会闪几秒),"
-                        + "已打开的文件夹窗口会自动还原成标签页。\n\n现在重启吗?\n(选「否」:下次开机后自然生效)",
+                        + restoreNote + opWarn + "\n\n现在重启吗?\n(选「否」:下次开机后自然生效)",
                         "去除快捷方式小箭头", MessageBoxButtons.YesNo, MessageBoxIcon.Question)) {
                     System.Threading.Tasks.Task.Run((Action)delegate {
                         try {
-                            ShortcutArrowCleaner.RestartExplorerAndRestoreFolders();
+                            // v1.4.11:先限时快照,失败/超时(explorer COM 无征兆挂起,合并模块
+                            // 2026-10-04 实测)时回 UI 征询是否仍重启——此前裸 COM 枚举挂死时
+                            // taskkill 照杀,已开标签全丢且问句承诺的「自动还原」失实(merge-side-2)
+                            List<string> folders = ShortcutArrowCleaner.SnapshotOpenFolders(3000);
+                            if (folders == null) {
+                                AppLog.Write("小箭头:文件夹快照失败/超时,回 UI 征询是否仍重启");
+                                var decided = new AutoResetEvent(false);
+                                bool go = false;
+                                ui.Post(delegate(object s2) {
+                                    go = DialogResult.Yes == MessageBox.Show(
+                                        "已打开文件夹窗口的快照获取失败(资源管理器可能无响应),\n"
+                                        + "重启后这些窗口将无法自动还原。\n\n仍要现在重启吗?",
+                                        "去除快捷方式小箭头", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                                    decided.Set();
+                                }, null);
+                                if (!decided.WaitOne(120000) || !go) {
+                                    AppLog.Write("小箭头:快照失败后放弃重启(用户否/超时无应答)");
+                                    return;
+                                }
+                                folders = new List<string>();
+                            }
+                            ShortcutArrowCleaner.RestartExplorerAndRestoreFolders(folders);
                         } catch (Exception ex) {
                             AppLog.Write("小箭头:资源管理器重启失败: " + ex.Message);
                         }

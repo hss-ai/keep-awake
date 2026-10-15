@@ -10,7 +10,7 @@
 用法:python build_keep_awake.py                (默认全流程:构建+装机+桌面快捷方式)
       python build_keep_awake.py --build-only  (仅生成图标并编译到 build/KeepAwake.exe,
                                                 CI 用:跳过停旧进程/装机/建快捷方式)
-      (在本仓库根目录跑,三个 .cs 源文件须同目录)
+      (在本仓库根目录跑,五个 .cs 源文件须同目录)
 依赖:Pillow(pip install pillow,仅构建期);csc 用系统自带 Framework64 v4.0.30319;
       装机步骤用系统自带 powershell.exe 与 taskkill,无 pwsh 依赖。
 重复跑 = 重建覆盖(覆盖前自动停掉在跑的旧实例)。
@@ -117,10 +117,27 @@ def source_version() -> str:
     """
     import re
     with open(os.path.join(HERE, "keep_awake_tray.cs"), encoding="utf-8") as f:
-        m = re.search(r"启动\(v(\d+\.\d+\.\d+)\)", f.read())
+        # v1.4.11:正则锚定 AppLog.Write 的启动行——此前对全文取首个匹配,文件前部将来
+        # 出现含『启动(vX.Y.Z)』的注释/变更日志就会静默取错版本(审查 build-3)
+        m = re.search(r'AppLog\.Write\("启动\(v(\d+\.\d+\.\d+)\)"\)', f.read())
     if not m:
-        raise SystemExit("keep_awake_tray.cs 里没找到『启动(vX.Y.Z)』版本行,版本号无从注入")
+        raise SystemExit("keep_awake_tray.cs 里没找到 AppLog.Write 启动版本行,版本号无从注入")
     return m.group(1)
+
+
+def check_tag() -> int:
+    """CI tag 构建用(build.yml 调 --check-tag):校验 git tag 与源码版本一致。
+
+    v1.4.11 新增(审查 C12①/build-2):版本四处表面(启动日志行/AssemblyInfo/manifest
+    副本/git tag)此前只有前三处对齐,tag 无 gate——忘 bump 启动行就打 tag 会发布
+    tag↔exe 版本错位的产物。tag 名取 CI 注入的 GITHUB_REF_NAME。"""
+    tag = os.environ.get("GITHUB_REF_NAME", "")
+    version = source_version()
+    if tag == "v" + version:
+        print(f"tag/版本一致:{tag}")
+        return 0
+    print(f"tag {tag} 与源码版本 v{version} 不一致——先改 keep_awake_tray.cs 启动日志行再打 tag")
+    return 1
 
 
 def write_version_sources(version: str, asm_path: str, manifest_copy: str) -> None:
@@ -147,6 +164,8 @@ def write_version_sources(version: str, asm_path: str, manifest_copy: str) -> No
 
 
 def main() -> int:
+    if "--check-tag" in sys.argv:
+        return check_tag()
     build_only = "--build-only" in sys.argv
     for src_file in SRC_FILES:
         if not os.path.isfile(src_file):
@@ -171,6 +190,7 @@ def main() -> int:
 
     compile_cmd = [
         CSC, "/nologo", "/target:winexe", "/codepage:65001", "/optimize+",
+        "/warnaserror+",  # v1.4.11(审查 C12②):存量零 warning 实证后开启,警告即编译失败
         "/win32icon:" + ico, "/win32manifest:" + manifest_out, "/out:" + out_exe,
         "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll", "/r:Microsoft.CSharp.dll",
         "/r:" + find_gac_assembly("UIAutomationClient"),
@@ -201,9 +221,19 @@ def main() -> int:
             break
         except PermissionError:
             time.sleep(0.5)
+        except OSError as e:   # v1.4.11(审查 build-4):磁盘满/路径非法等非占用类错误直接报清原因
+            raise SystemExit(f"装机拷贝失败(非占用类 IO 错误):{e}")
     else:
         raise SystemExit("旧实例未能停止,KeepAwake.exe 覆盖失败")
     print(f"[3/4] 已安装:{dest}")
+    # v1.4.11(审查 C9):上面的 taskkill /F 是强杀,在跑实例没机会 Disengage(撤销电源
+    # 护栏),残留要等下次启动才自愈。装机后立刻用新 exe 的维护通道补一刀恢复,闭环不留
+    # 窗口;失败不阻断装机(新实例启动仍会无条件自愈)
+    try:
+        subprocess.run([dest, "--restore-power"], capture_output=True, timeout=15)
+        print("[3.5/4] 已补跑 --restore-power(清理被强杀旧实例的电源护栏残留)")
+    except Exception as e:
+        print(f"[3.5/4] --restore-power 补跑未成({e});不影响装机,下次启动会自愈")
 
     lnk = os.path.join(desktop_dir(), SHORTCUT_NAME)
     make_shortcut(dest, lnk)

@@ -264,24 +264,68 @@ static class ShortcutArrowCleaner {
 
     // ==== 桌面生效的最后一步:重启资源管理器(托盘弹问句后代办) ====
 
-    /// <summary>重启资源管理器,并把之前打开的文件夹原样重开(合并器会自动并成标签页)。
-    /// 为什么必须重启:桌面图标由常驻 Explorer 进程合成,"29=箭头"映射缓存在进程内,
-    /// F5/图标缓存通知实测全刷不动(见文件头);每个文件夹间隔重开,给合并器留并入节奏。
-    /// 在后台线程跑(约 8~10s),别卡托盘 UI。</summary>
-    public static void RestartExplorerAndRestoreFolders() {
-        var folders = new List<string>();
+    /// <summary>有没有正在进行的文件复制/移动/删除进度窗(类名 OperationStatusWindow,
+    /// 宿主就是 explorer.exe)——taskkill /f 重启会把进行中的文件操作连着任务一起中断。
+    /// v1.4.11:确认框此前不提示这层代价(审查 C5),检出即由调用方加警示文案。</summary>
+    public static bool HasRunningFileOperations() {
         try {
-            dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
-            foreach (dynamic w in shell.Windows()) {
-                try {
-                    string p = w.Document.Folder.Self.Path;
-                    if (!string.IsNullOrEmpty(p)) folders.Add(p);
-                } catch {
-                }
-            }
-        } catch (Exception ex) {
-            AppLog.Write("小箭头:文件夹快照失败(还原跳过): " + ex.Message);
+            return FindWindow("OperationStatusWindow", null) != IntPtr.Zero;
+        } catch {
+            return false;
         }
+    }
+
+    /// <summary>限时快照当前打开的文件夹窗口(Shell 记录每标签一条)。null=失败/超时
+    /// (调用方征询用户),空表=没有开着的文件夹。v1.4.11:此前逐窗口裸 COM 读
+    /// Document.Folder.Self.Path 无限时——explorer COM 会无征兆挂起(合并模块 2026-10-04
+    /// 实测枚举都挂过),挂死时快照永远回不来、后面的 taskkill 照杀,已开标签全丢且
+    /// 确认框承诺的「自动还原」失实(审查 merge-side-2)。现在整个枚举搬进独立 STA 线程
+    /// 限时跑;文件系统窗口优先读 LocationURL(便宜),仅空 URL(虚拟位置)才读 Self.Path
+    /// (跨进程慢调用)。同文件夹开多窗只记一次(保序去重)。</summary>
+    public static List<string> SnapshotOpenFolders(int timeoutMs) {
+        List<string> result = null;
+        Thread t = new Thread((ThreadStart)delegate {
+            List<string> folders = null;
+            try {
+                folders = new List<string>();
+                dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
+                try {
+                    foreach (dynamic w in shell.Windows()) {
+                        try {
+                            string url = w.LocationURL;
+                            string p = "";
+                            if (!string.IsNullOrEmpty(url)) {
+                                if (url.StartsWith("file:///"))
+                                    p = Uri.UnescapeDataString(url.Substring(8)).Replace('/', '\\');
+                                else if (url.StartsWith("file://"))
+                                    p = Uri.UnescapeDataString(url.Substring(5)).Replace('/', '\\');
+                            } else {
+                                p = w.Document.Folder.Self.Path;   // 虚拟位置(::{GUID});读不到留空跳过
+                            }
+                            if (!string.IsNullOrEmpty(p) && !folders.Contains(p)) folders.Add(p);
+                        } catch {
+                        }
+                    }
+                } finally {
+                    try { Marshal.ReleaseComObject(shell); } catch { }
+                }
+            } catch (Exception ex) {
+                AppLog.Write("小箭头:文件夹快照枚举异常: " + ex.Message);
+                folders = null;                     // 整体失败(而非部分):让调用方征询用户
+            }
+            result = folders;
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);    // Shell COM 走 STA 稳(与合并模块同语义)
+        t.Start();
+        return t.Join(timeoutMs) ? result : null;   // 超时:null=不确定,交调用方征询
+    }
+
+    /// <summary>重启资源管理器,并按调用方先行取得的快照原样重开文件夹(合并器自动并回
+    /// 标签页)。为什么必须重启:桌面图标由常驻 Explorer 进程合成,"29=箭头"映射缓存在
+    /// 进程内,F5/图标缓存通知实测全刷不动(见文件头);每个文件夹间隔重开,给合并器留
+    /// 并入节奏。在后台线程跑(约 8~10s),别卡托盘 UI。</summary>
+    public static void RestartExplorerAndRestoreFolders(List<string> folders) {
         AppLog.Write("小箭头:重启资源管理器,快照 " + folders.Count + " 个文件夹");
         try {
             var kill = new ProcessStartInfo("taskkill", "/f /im explorer.exe") {
@@ -292,7 +336,14 @@ static class ShortcutArrowCleaner {
         } catch {
         }
         Thread.Sleep(800);                          // 等旧进程退干净
-        Process.Start("explorer.exe");
+        // v1.4.11:winlogon 的 AutoRestartShell 会自动拉起新 shell——任务栏若已回来就
+        // 别再 Process.Start 顶出一个多余的主页窗口(审查 C6);没回来才手动拉
+        bool shellBack = false;
+        for (int i = 0; i < 10; i++) {
+            if (FindWindow("Shell_TrayWnd", null) != IntPtr.Zero) { shellBack = true; break; }
+            Thread.Sleep(150);
+        }
+        if (!shellBack) Process.Start("explorer.exe");
         Thread.Sleep(3500);                         // 等桌面/任务栏就绪
         foreach (string p in folders) {
             try {
@@ -306,6 +357,9 @@ static class ShortcutArrowCleaner {
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, UIntPtr wParam, string lParam,
         uint flags, uint timeout, out UIntPtr result);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
     static bool IsElevated() {
         using (var id = WindowsIdentity.GetCurrent()) {

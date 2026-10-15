@@ -30,6 +30,14 @@ jobs:
           # runner 上 Python 默认 cp1252,中文 print 会 UnicodeEncodeError 崩构建
           PYTHONUTF8: "1"
 
+      # v1.4.11(审查 C12①/build-2):tag 构建时校验 tag 与源码版本一致,
+      # 忘 bump keep_awake_tray.cs 启动行就打 tag 会发布版本错位的产物,此处拦下
+      - name: Verify tag matches source version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python build_keep_awake.py --check-tag
+        env:
+          PYTHONUTF8: "1"
+
       - name: Generate sha256
         shell: pwsh
         run: |

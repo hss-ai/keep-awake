@@ -18,7 +18,9 @@
 //      (Ctrl+T/Ctrl+L+SendInput)兜底,打字/回车前复查前台,丢了就放弃合并;
 //   4) 若它是第一个资源管理器窗口:保留,它就是"那一个"。
 //
-// 限制:依赖 Win11 22H2+ 资源管理器原生标签页;合并瞬间有按键注入,期间请勿抢键盘。
+// 限制:依赖 Win11 22H2+ 资源管理器原生标签页;Win10/无标签页的系统整功能自动停用
+//   (OsSupportsTabs,v1.4.11——那边键盘兜底的 Ctrl+L 会把既有窗口当前视图导航走);
+//   合并瞬间有按键注入,期间请勿抢键盘。
 // 线程模型:WinEvent 钩子装在 UI 线程(消息循环所在);合并每窗口一个工作线程
 //   (explorer 的 COM/UIA 会间歇性无响应,独立线程保证一个挂住不堵后续窗口)。
 // 注意:C# 5 语法(系统 csc 不认 C#6+);编译需加 /r:Microsoft.CSharp.dll(dynamic COM)。
@@ -130,6 +132,33 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private static string GetTitle(IntPtr hWnd) {
         var sb = new StringBuilder(256);
         return GetWindowTextNative(hWnd, sb, 256) > 0 ? sb.ToString() : "";
+    }
+
+    // ==== Win11 标签页能力闸(v1.4.11) ====
+    // Win10/无原生标签页的系统:AddButton 永远找不到,合并必然落进键盘兜底;而 Win10 的
+    // Ctrl+T 无效,Ctrl+L 会把【既有窗口当前视图】导航走、随后按「路径存在」误判成功关掉
+    // 新窗——审查 C1 实锤的「劫持既有窗口」。整功能在此类系统直接停用(托盘菜单弹气泡
+    // 说明,不再静默搞破坏)。读注册表 build 号而非 Environment.OSVersion:后者受 manifest
+    // 兼容性 GUID 谎报影响,注册表是实况;探测失败不拦截(失败自然保窗,别无故关死功能)。
+    static bool? tabsCapable;
+
+    public static bool OsSupportsTabs() {
+        if (tabsCapable.HasValue) return tabsCapable.Value;
+        bool ok = true;
+        try {
+            using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")) {
+                if (key != null) {
+                    int build;
+                    if (int.TryParse(key.GetValue("CurrentBuildNumber") as string, out build))
+                        ok = build >= 22000;
+                }
+            }
+        } catch {
+            ok = true;
+        }
+        tabsCapable = ok;
+        return ok;
     }
 
     private IntPtr hook;
@@ -329,22 +358,42 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 if (!kbGate) {
                     Log("键盘兜底:互斥门等待超时(另一合并正在注入),放弃");
                 } else if (BringToFrontVerified(target)) {
-                    SendCtrlCombo(VK_T);
-                    Thread.Sleep(400);
-                    NavigateTarget(target, path);
-                    Thread.Sleep(500);
-                    if (!TabExistsInWindow(target, path)) {
-                        Log("键盘首轮未见目标标签(当前标签: " + TabsSnapshot(target) + "),重试一次");
-                        NavigateTarget(target, path);
-                        Thread.Sleep(500);
+                    // v1.4.11 Ctrl+T 守卫:注入前先取空标签基线,注入后必须核实「新空标签
+                    // 真的开出来了」才允许打字。此前 Ctrl+T 被吞/无标签页时照旧 Ctrl+L,
+                    // 路径会打进目标窗口【当前活动标签】= 用户的原视图,TabExistsInWindow
+                    // 又按「路径存在」误判合并成功关掉新窗(审查 C1/键盘兜底零守卫实锤)。
+                    // COM 路径自 v1.2.2 就有同款基线+1 守卫(NavigateNewTab),此处对齐。
+                    int emptyBase = ComCall(2000, delegate() { return CountEmptyTabs(target); }, -1);
+                    if (emptyBase < 0) {
+                        Log("键盘兜底:空标签基线计数超时(COM 无响应),不打字、放弃合并");
+                    } else {
+                        SendCtrlCombo(VK_T);
+                        bool tabOpened = false;
+                        for (int i = 0; i < 10 && !tabOpened; i++) {
+                            Thread.Sleep(200);
+                            int nowEmpty = ComCall(1500, delegate() { return CountEmptyTabs(target); }, -1);
+                            if (nowEmpty >= emptyBase + 1) tabOpened = true;
+                            else if (nowEmpty < 0) break;   // COM 掉了,别盲打
+                        }
+                        if (!tabOpened) {
+                            Log("键盘兜底:Ctrl+T 后未见新增空标签(被吞或无标签页),不打字、放弃合并(窗口保留)");
+                        } else {
+                            NavigateTarget(target, path);
+                            Thread.Sleep(500);
+                            if (!TabExistsInWindow(target, path)) {
+                                Log("键盘首轮未见目标标签(当前标签: " + TabsSnapshot(target) + "),重试一次");
+                                NavigateTarget(target, path);
+                                Thread.Sleep(500);
+                            }
+                            if (!TabExistsInWindow(target, path)) {
+                                Log("重试仍未到位(当前标签: " + TabsSnapshot(target) + "),改用剪贴板粘贴兜底");
+                                NavigateByClipboard(target, path);
+                                Thread.Sleep(600);
+                            }
+                            merged = TabExistsInWindow(target, path);
+                            Log("键盘兜底导航验证: " + (merged ? "OK" : "仍失败"));
+                        }
                     }
-                    if (!TabExistsInWindow(target, path)) {
-                        Log("重试仍未到位(当前标签: " + TabsSnapshot(target) + "),改用剪贴板粘贴兜底");
-                        NavigateByClipboard(target, path);
-                        Thread.Sleep(600);
-                    }
-                merged = TabExistsInWindow(target, path);
-                Log("键盘兜底导航验证: " + (merged ? "OK" : "仍失败"));
                 } else {
                     Log("无法把目标窗口置前,跳过键盘兜底");
                 }
@@ -361,10 +410,22 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 if (!kbGate) {
                     Log("主页标签:键盘互斥门等待超时,放弃");
                 } else if (BringToFrontVerified(target)) {
-                    SendCtrlCombo(VK_T);
-                    Thread.Sleep(400);
-                    merged = true;
-                    Log("虚拟文件夹:已开主页标签");
+                    // v1.4.11:此前 Ctrl+T 后无条件 merged=true,是全函数唯一零核实路径——
+                    // Ctrl+T 落空时源窗照关,虚拟位置窗口(主页/此电脑)凭空消失且无替代标签
+                    //(path 读超时=""常与 explorer 忙同源,固定 400ms 等待更易不够)。同款基线+1 守卫
+                    int emptyBase = ComCall(2000, delegate() { return CountEmptyTabs(target); }, -1);
+                    if (emptyBase < 0) {
+                        Log("主页标签:空标签基线计数超时,放弃(窗口保留)");
+                    } else {
+                        SendCtrlCombo(VK_T);
+                        for (int i = 0; i < 10 && !merged; i++) {
+                            Thread.Sleep(200);
+                            int nowEmpty = ComCall(1500, delegate() { return CountEmptyTabs(target); }, -1);
+                            if (nowEmpty >= emptyBase + 1) merged = true;
+                            else if (nowEmpty < 0) break;
+                        }
+                        Log("虚拟文件夹:" + (merged ? "已核实开出新标签" : "Ctrl+T 后未见新增空标签,放弃(窗口保留)"));
+                    }
                 } else {
                     Log("虚拟文件夹但无法置前,放弃");
                 }
@@ -380,7 +441,20 @@ internal sealed class ExplorerTabMerger : IDisposable {
         }
 
         if (IsWindow(newHwnd)) {
-            PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            // v1.4.11 关窗前复核:从路径判定到此刻常隔 3~10s(闸门排队+操控段,最坏 30s+),
+            // 用户可能已在新窗里导航去了别处——WM_CLOSE 关的是整窗全部标签,不能把用户
+            // 接管后的内容带走。现值与当初不符/读不到都保窗(至多留一个重复标签,好过丢视图)
+            string cur = path.StartsWith("::")
+                ? ComCall(2000, delegate() { return GetExplorerShellPath(newHwnd); }, null)
+                : ComCall(2000, delegate() { return GetExplorerLocation(newHwnd); }, null);
+            bool same = path.Length > 0
+                ? (cur != null && string.Equals(cur, path, StringComparison.OrdinalIgnoreCase))
+                : (cur != null && cur.Length == 0);   // 主页形态:能读出实体路径=已被接管
+            if (same) {
+                PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            } else {
+                Log("关窗前复核未通过(现值=" + (cur == null ? "null" : cur) + "),新窗可能已被用户接管,保留不关");
+            }
         }
         Thread.Sleep(300);                       // 等关窗后的焦点归还尘埃落定
         ShowTargetToUser(target);                // 还原最小化 + 尽力带到眼前(不注入按键)
@@ -731,8 +805,13 @@ internal sealed class ExplorerTabMerger : IDisposable {
 
     /// <summary>在目标窗口当前标签导航到 path:Ctrl+L 聚焦地址栏,打字期间临时摘掉
     /// 该编辑框的输入法上下文(否则中文输入法会吞掉 unicode 按键、回车变成确认候选词),
-    /// 输入路径回车后恢复。打字前与回车前各复查一次前台。</summary>
+    /// 输入路径回车后恢复。Ctrl+L 前/打字前/回车前各复查一次前台(v1.4.11 补第一道:
+    /// 组合键打进用户当前应用比打字更糟,直达菜单/快捷键)。</summary>
     private static void NavigateTarget(IntPtr targetHwnd, string path) {
+        if (!StillForeground(targetHwnd)) {
+            Log("键盘兜底:Ctrl+L 前前台已丢失,中止(新窗口保留)");
+            return;
+        }
         SendCtrlCombo(VK_L);
         Thread.Sleep(160);
         uint pid;
@@ -769,28 +848,62 @@ internal sealed class ExplorerTabMerger : IDisposable {
     }
 
     /// <summary>兜底导航:Ctrl+L 后粘贴路径再回车。粘贴不走键盘注入,天然绕过输入法;
-    /// 代价是短暂占用剪贴板——剪贴板里有图片/文件等非文本内容时不动它(恢复不了就毁了),
-    /// 直接放弃本兜底;文本则用完尽力恢复。粘贴前与回车前各复查一次前台。</summary>
+    /// 代价是短暂占用剪贴板——只有【纯文本】才敢占用(v1.4.11 收紧):SetText 是整剪贴板
+    /// 替换,Word/Excel 复制的富文本/图片等任何非文本格式会一并被毁、事后也只还原得回
+    /// 纯文本半边(审查 C4/merge-side-1)。所以格式清单里出现任何非纯文本伴随格式之外的
+    /// 格式就一律不动它(恢复不了就毁了),直接放弃本兜底;纯文本则用完尽力恢复,恢复
+    /// 失败记日志(此前空吞,留不下诊断线索)。Ctrl+L 前/粘贴前/回车前各复查一次前台
+    /// (v1.4.11 补第一道)。</summary>
     private static void NavigateByClipboard(IntPtr targetHwnd, string path) {
         string prev = null;
         try {
-            if (System.Windows.Forms.Clipboard.ContainsText()) {
-                prev = System.Windows.Forms.Clipboard.GetText();
-            } else if (System.Windows.Forms.Clipboard.ContainsImage()
-                    || System.Windows.Forms.Clipboard.ContainsFileDropList()
-                    || System.Windows.Forms.Clipboard.ContainsAudio()) {
-                Log("剪贴板里有非文本内容(图片/文件),不占用,兜底放弃");
+            var data = System.Windows.Forms.Clipboard.GetDataObject();
+            if (data == null) {
+                Log("剪贴板打不开(被瞬时占用),兜底放弃");
                 return;
             }
-        } catch {
-        }
-        try {
-            System.Windows.Forms.Clipboard.SetText(path);
-        } catch {
-            Log("剪贴板写入失败,兜底放弃");
+            string[] formats = data.GetFormats(false);      // false=不做格式转换,看真实在场清单
+            bool hasText = false;
+            foreach (string f in formats) {
+                if (f == System.Windows.Forms.DataFormats.UnicodeText
+                        || f == System.Windows.Forms.DataFormats.Text
+                        || f == "System.String") { hasText = true; break; }
+            }
+            if (!hasText) {
+                Log("剪贴板无文本(图片/文件/其它格式),不占用,兜底放弃");
+                return;
+            }
+            foreach (string f in formats) {
+                // 纯文本的常规伴随格式(System.String=WinForms 托管串,Locale=CF_LOCALE,
+                // OEMText=OEM 侧伴随)之外的任何格式在场=富内容(HTML/RTF/Csv/Bitmap…),撤
+                if (f == System.Windows.Forms.DataFormats.UnicodeText
+                        || f == System.Windows.Forms.DataFormats.Text
+                        || f == "System.String" || f == "Locale"
+                        || f == System.Windows.Forms.DataFormats.OemText) continue;
+                Log("剪贴板含非纯文本格式(" + f + "),不占用,兜底放弃");
+                return;
+            }
+            prev = data.GetData(System.Windows.Forms.DataFormats.UnicodeText, true) as string;
+            if (prev == null) prev = data.GetData(System.Windows.Forms.DataFormats.Text, true) as string;
+            if (prev == null) {
+                Log("剪贴板文本读取失败,兜底放弃");
+                return;
+            }
+        } catch (Exception ex) {
+            Log("剪贴板检查异常(" + ex.Message + "),兜底放弃");
             return;
         }
         try {
+            System.Windows.Forms.Clipboard.SetText(path);
+        } catch (Exception ex) {
+            Log("剪贴板写入失败(" + ex.Message + "),兜底放弃");
+            return;
+        }
+        try {
+            if (!StillForeground(targetHwnd)) {
+                Log("剪贴板兜底:Ctrl+L 前前台已丢失,中止(新窗口保留)");
+                return;
+            }
             SendCtrlCombo(VK_L);
             Thread.Sleep(160);
             if (!StillForeground(targetHwnd)) {
@@ -809,7 +922,8 @@ internal sealed class ExplorerTabMerger : IDisposable {
             try {
                 if (prev != null) System.Windows.Forms.Clipboard.SetText(prev);
                 else System.Windows.Forms.Clipboard.Clear();   // 用之前就是空的:清掉路径还他空剪贴板,别留下尾巴
-            } catch {
+            } catch (Exception ex) {
+                Log("剪贴板恢复失败(原纯文本可能丢,剪贴板里留的是合并路径): " + ex.Message);
             }
         }
     }
