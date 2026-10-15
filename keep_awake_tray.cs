@@ -10,7 +10,8 @@
 //   - 启动即开启「系统防待机」(屏幕允许自动关),托盘弹气泡提示;
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
-//     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11) /
+//     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11;
+//       开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住)/
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
 //       Keyboard Manager;两条映射各自独立开关。Win(右)含三件套识别:用户
 //       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
@@ -88,6 +89,35 @@ static class AppLog {
             File.AppendAllText(LogPath,
                 DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
         } catch {
+        }
+    }
+}
+
+// 「资源管理器单窗口合并」开关持久化(v1.4.12):与启动静音同键——刻意独立于电源护栏的
+// Software\KeepAwake 键(那处 Restore 完会把整个键删净,混放会被顺手清掉)。未写过 =
+// 默认开(保持既有行为);用户关过一次就记住,重启不再被强行拉回开。
+static class ExplorerMergePref {
+    const string RegPath = "Software\\KeepAwakePrefs";
+    const string ValueName = "ExplorerMergeEnabled";
+
+    public static bool Get() {
+        try {
+            using (var key = Registry.CurrentUser.OpenSubKey(RegPath)) {
+                if (key == null) return true;                    // 未写过 = 默认开
+                return Convert.ToInt32(key.GetValue(ValueName, 1)) != 0;
+            }
+        } catch {
+            return true;
+        }
+    }
+
+    public static void Set(bool on) {
+        try {
+            using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) {
+                key.SetValue(ValueName, on ? 1 : 0, RegistryValueKind.DWord);
+            }
+        } catch (Exception ex) {
+            AppLog.Write("资源管理器合并开关写入失败: " + ex.Message);
         }
     }
 }
@@ -263,7 +293,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.11)");
+        AppLog.Write("启动(v1.4.12)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -323,11 +353,18 @@ internal sealed class TrayContext : ApplicationContext {
         timer.Start();
 
         merger = new ExplorerTabMerger();
-        // v1.4.11 Win11 闸:Win10/无标签页系统整功能停用——那边 AddButton 永远找不到,
-        // 键盘兜底的 Ctrl+L 会把既有窗口当前视图导航走(审查 C1),默认开改为「有能力才开」
-        miExplorer.Checked = ExplorerTabMerger.OsSupportsTabs();
+        // v1.4.11 Win11 闸:Win10/无标签页系统整功能停用(那边键盘兜底的 Ctrl+L 会把
+        // 既有窗口当前视图导航走,审查 C1);v1.4.12 起开关选择持久化——关过一次就记住,
+        // 重启不再被强行拉回开(未写过 = 默认开,保持既有行为)
+        bool mergeSupported = ExplorerTabMerger.OsSupportsTabs();
+        bool mergeWanted = ExplorerMergePref.Get();
+        miExplorer.Checked = mergeSupported && mergeWanted;
         merger.Enabled = miExplorer.Checked;
-        if (!miExplorer.Checked) AppLog.Write("资源管理器合并:系统无标签页能力(Win10?),已停用");
+        if (!miExplorer.Checked) {
+            AppLog.Write(mergeSupported
+                ? "资源管理器合并:按记住的开关关闭"
+                : "资源管理器合并:系统无标签页能力(Win10?),已停用");
+        }
 
         remapper = new KeyRemapper();
         miKeymapF2.Checked = true;    // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
@@ -396,6 +433,7 @@ internal sealed class TrayContext : ApplicationContext {
         }
         miExplorer.Checked = !miExplorer.Checked;
         merger.Enabled = miExplorer.Checked;
+        ExplorerMergePref.Set(miExplorer.Checked);   // v1.4.12:记住选择,重启不再重置
     }
 
     void OnToggleKeymapF2(object sender, EventArgs e) {
