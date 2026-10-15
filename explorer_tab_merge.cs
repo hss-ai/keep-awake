@@ -118,14 +118,18 @@ internal sealed class ExplorerTabMerger : IDisposable {
 
     // 诊断日志(合并行为出问题时看 %TEMP%\KeepAwake_merge.log;超 512KB 自动重开)
     private static readonly string LogPath = Path.Combine(Path.GetTempPath(), "KeepAwake_merge.log");
+    // 串行化:合并 job 线程并发 Append 撞文件占用会整行丢失(与 AppLog 同源,v1.4.13 一并加固)
+    private static readonly object logLock = new object();
 
     private static void Log(string msg) {
-        try {
-            var fi = new FileInfo(LogPath);
-            if (fi.Exists && fi.Length > 524288) fi.Delete();
-            File.AppendAllText(LogPath,
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
-        } catch {
+        lock (logLock) {
+            try {
+                var fi = new FileInfo(LogPath);
+                if (fi.Exists && fi.Length > 524288) fi.Delete();
+                File.AppendAllText(LogPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
+            } catch {
+            }
         }
     }
 

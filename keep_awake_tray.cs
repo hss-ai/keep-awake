@@ -13,7 +13,8 @@
 //     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11;
 //       开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住)/
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
-//       Keyboard Manager;两条映射各自独立开关。Win(右)含三件套识别:用户
+//       Keyboard Manager;两条映射各自独立开关,选择持久化 KeepAwakePrefs
+//       v1.4.13。Win(右)含三件套识别:用户
 //       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
 //       25ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
@@ -82,13 +83,18 @@ static class Program {
 // 应用级日志:防待机开关/护栏动作/启停留痕(出问题对时间线用;512KB 自动重开)
 static class AppLog {
     static readonly string LogPath = Path.Combine(Path.GetTempPath(), "KeepAwake_app.log");
+    // 串行化:启动期 UI 线程(开关初值)与钩子线程(安装回执)同毫秒并发 Append,
+    // File.AppendAllText 撞文件占用抛异常被吞=整行丢失(v1.4.13 实证丢过"Win 开启"行)
+    static readonly object logLock = new object();
     public static void Write(string msg) {
-        try {
-            var fi = new FileInfo(LogPath);
-            if (fi.Exists && fi.Length > 524288) fi.Delete();
-            File.AppendAllText(LogPath,
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
-        } catch {
+        lock (logLock) {
+            try {
+                var fi = new FileInfo(LogPath);
+                if (fi.Exists && fi.Length > 524288) fi.Delete();
+                File.AppendAllText(LogPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ") + msg + Environment.NewLine);
+            } catch {
+            }
         }
     }
 }
@@ -118,6 +124,35 @@ static class ExplorerMergePref {
             }
         } catch (Exception ex) {
             AppLog.Write("资源管理器合并开关写入失败: " + ex.Message);
+        }
+    }
+}
+
+// 键映射两条开关的持久化(v1.4.13):与合并/静音同键,理由同上(独立于会被电源护栏
+// Restore 删净的 Software\KeepAwake 键)。未写过 = 默认开,既有行为不变。
+static class KeymapPref {
+    const string RegPath = "Software\\KeepAwakePrefs";
+    public const string F2Name = "KeymapF2Enabled";
+    public const string WinName = "KeymapWinEnabled";
+
+    public static bool Get(string name) {
+        try {
+            using (var key = Registry.CurrentUser.OpenSubKey(RegPath)) {
+                if (key == null) return true;                    // 未写过 = 默认开
+                return Convert.ToInt32(key.GetValue(name, 1)) != 0;
+            }
+        } catch {
+            return true;
+        }
+    }
+
+    public static void Set(string name, bool on) {
+        try {
+            using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) {
+                key.SetValue(name, on ? 1 : 0, RegistryValueKind.DWord);
+            }
+        } catch (Exception ex) {
+            AppLog.Write("键映射开关写入失败(" + name + "): " + ex.Message);
         }
     }
 }
@@ -293,7 +328,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.12)");
+        AppLog.Write("启动(v1.4.13)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -367,10 +402,15 @@ internal sealed class TrayContext : ApplicationContext {
         }
 
         remapper = new KeyRemapper();
-        miKeymapF2.Checked = true;    // 默认开启:接替 PowerToys 键映射(用户唯一在用的那条)
-        remapper.F2Enabled = true;
-        miKeymapWin.Checked = true;   // 默认开启:右 Win 变右 Ctrl(左 Win 保留开始菜单)
-        remapper.WinEnabled = true;
+        // v1.4.13:两条映射的开关选择持久化(与合并开关同款;未写过 = 默认开,既有行为不变)。
+        // 关态的日志在托盘侧补:KeyRemapper 的 setter 对「等于当前值」早退不落日志,
+        // 不补的话「记住的关」在时间线上无痕,排障无从对起
+        miKeymapF2.Checked = KeymapPref.Get(KeymapPref.F2Name);   // 默认开:接替 PowerToys 键映射
+        remapper.F2Enabled = miKeymapF2.Checked;
+        miKeymapWin.Checked = KeymapPref.Get(KeymapPref.WinName); // 默认开:右 Win 变右 Ctrl(左 Win 保留)
+        remapper.WinEnabled = miKeymapWin.Checked;
+        if (!miKeymapF2.Checked) AppLog.Write("键映射 F2→Ctrl+W: 按记住的开关关闭");
+        if (!miKeymapWin.Checked) AppLog.Write("键映射 Win(右)→Ctrl(右): 按记住的开关关闭");
 
         miAutoStart.Checked = AutoStartEnabled();
         if (miAutoStart.Checked) SetAutoStart(true); // 路径自愈:exe 挪窝后指向当前实例
@@ -439,11 +479,13 @@ internal sealed class TrayContext : ApplicationContext {
     void OnToggleKeymapF2(object sender, EventArgs e) {
         miKeymapF2.Checked = !miKeymapF2.Checked;
         remapper.F2Enabled = miKeymapF2.Checked;
+        KeymapPref.Set(KeymapPref.F2Name, miKeymapF2.Checked);   // v1.4.13:记住选择,重启不再重置
     }
 
     void OnToggleKeymapWin(object sender, EventArgs e) {
         miKeymapWin.Checked = !miKeymapWin.Checked;
         remapper.WinEnabled = miKeymapWin.Checked;
+        KeymapPref.Set(KeymapPref.WinName, miKeymapWin.Checked); // v1.4.13:同上
     }
 
     void OnToggleAutoStart(object sender, EventArgs e) {
