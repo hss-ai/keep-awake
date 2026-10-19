@@ -22,7 +22,10 @@
 //       SetMute 静音:幂等"设置"非切换、不改音量值,取消静音即恢复原音量;
 //       开关持久化 HKCU Software\KeepAwakePrefs 默认开,详见 audio_mute.cs) /
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
-//       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) / 退出;
+//       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) /
+//     ▸键盘按键失灵…修复(v1.4.14:间歇性单键失灵的一键保守复位——重枚举键盘设备
+//       + 清 Scancode Map/粘滞键/筛选键,自我提权拉 --keyboard-reset 实例,
+//       详见 keyboard_reset.cs) / 退出;
 //   - 唤醒请求只挂在本进程(SetThreadExecutionState),退出/被杀/注销系统自动撤销;
 //     防待机开启期间另把「在此时间后休眠」的交流侧临时清零(见 PowerHibernateGuard),
 //     关闭/退出恢复,异常退出下次启动自愈——这是唯一一处系统级修改;
@@ -38,6 +41,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -63,6 +67,11 @@ static class Program {
         // 不进下面的互斥/托盘逻辑(同 --restore-power 的套路)
         if (args.Length > 1 && args[0] == "--arrow") {
             return ShortcutArrowCleaner.ApplyFromCli(args[1]);
+        }
+        // 「键盘按键失灵」一键修复的一次性提权实例(菜单经 UAC 拉起):重枚举键盘设备
+        // + 清异常开关,写完结果文件即退(同 --arrow 的套路)
+        if (args.Length > 0 && args[0] == "--keyboard-reset") {
+            return KeyboardReset.ApplyFromCli();
         }
         // 测试钩子:只生成空白图标,不碰注册表(tests/probe_arrow.py 校验成品 exe 的 ICO 字节)
         if (args.Length > 1 && args[0] == "--write-blank-ico") {
@@ -319,6 +328,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miMuteStartup;  // 启动时静音(默认开,持久化 HKCU)
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
+    readonly ToolStripMenuItem miKeyboardReset;  // 键盘按键失灵一键修复(v1.4.14)
     readonly System.Windows.Forms.Timer timer;
     readonly Icon iconOn;
     readonly Icon iconOnDisplay;
@@ -328,7 +338,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.13)");
+        AppLog.Write("启动(v1.4.14)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -356,8 +366,11 @@ internal sealed class TrayContext : ApplicationContext {
         miMuteStartup.Click += OnToggleMuteStartup;
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
         miArrow.Click += OnToggleArrow;
+        miKeyboardReset = new ToolStripMenuItem("键盘按键失灵…修复");
+        miKeyboardReset.Click += OnKeyboardReset;
         miMore = new ToolStripMenuItem("更多工具");
         miMore.DropDownItems.Add(miArrow);
+        miMore.DropDownItems.Add(miKeyboardReset);
         var miExit = new ToolStripMenuItem("退出");
         miExit.Click += OnExit;
         menu.Items.Add(miState);
@@ -577,6 +590,88 @@ internal sealed class TrayContext : ApplicationContext {
                 tray.ShowBalloonTip(2500);
             }, null);
         });
+    }
+
+    // ==== 键盘按键失灵一键修复(v1.4.14) ====
+    // 为什么是菜单项而不是静默守护:故障是间歇性的、没有可查的持久痕迹(2026-10-16
+    // 排查实录),无从自动判定"现在是不是坏了",也不该在正常时反复重启键盘设备。
+    // 由用户判断"此刻确实失灵"再点一次,是我们能在无根因前提下做的最有效复位。
+    // 执行要跑在后台线程:UAC 无人点击期间 WaitForExit 会挂住,UI 线程一挂就是两
+    // 分钟(同 OnToggleArrow 的教训);完成后经同步上下文回 UI 弹结果窗。
+    void OnKeyboardReset(object sender, EventArgs e) {
+        miKeyboardReset.Enabled = false;   // 防重入
+        var ui = System.Threading.SynchronizationContext.Current;
+        System.Threading.Tasks.Task.Run((Action)delegate {
+            KeyboardResetResult r = null;
+            try {
+                r = KeyboardReset.Run();
+            } catch (Exception ex) {
+                AppLog.Write("键盘修复入口异常: " + ex.Message);
+            }
+            var res = r;
+            ui.Post(delegate(object s2) {
+                miKeyboardReset.Enabled = true;
+                ShowKeyboardResetReport(res);
+            }, null);
+        });
+    }
+
+    // 把修复结果如实摆出来——成功就确认,失败/可疑就明说,不粉饰。
+    void ShowKeyboardResetReport(KeyboardResetResult r) {
+        if (r == null) {
+            MessageBox.Show("修复过程异常中止,未能取得结果。\n详细信息见 %TEMP%\\KeepAwake_app.log。",
+                "键盘按键失灵修复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (r.NeedAdmin) {
+            MessageBox.Show("本项需要管理员权限来重新枚举键盘设备,UAC 被取消或未确认,本次未做任何修改。\n\n"
+                + "请重新点击并确认 UAC 弹窗。", "键盘按键失灵修复",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var sb = new StringBuilder();
+        if (r.Restarted > 0) {
+            sb.Append("已逐个重新枚举 ").Append(r.Restarted).Append(" 个键盘设备。\n");
+        }
+        if (r.ScanDevicesDone) {
+            sb.Append("已完成一次全局设备重新枚举(含内置键盘)。\n");
+        }
+        if (r.Restarted == 0 && !r.ScanDevicesDone) {
+            sb.Append("没有成功重新枚举任何键盘设备。\n");
+        }
+        if (r.ScanCodeMapCleared) {
+            sb.Append("已清除全局 Scancode Map(原值已备份,可还原)。\n");
+        }
+        foreach (var f in r.FlagsReset) {
+            sb.Append("已恢复 ").Append(f).Append(" 默认值。\n");
+        }
+        if (r.SkippedDisconnected > 0) {
+            sb.Append("(跳过 ").Append(r.SkippedDisconnected).Append(" 个未连接的键盘设备)");
+        }
+        if (sb.Length == 0) sb.Append("未做任何修改。\n");
+
+        // 有失败项 → 警示框,把每条原因摆出来,别让用户以为修好了
+        if (r.Failures.Count > 0) {
+            var warn = new StringBuilder(sb.ToString()).Append("\n以下动作未成功:\n");
+            foreach (var f in r.Failures) warn.Append("· ").Append(f).Append('\n');
+            if (r.Warnings.Count > 0) {
+                warn.Append("\n另有一项【未改动、仅提示】:\n");
+                foreach (var w in r.Warnings) warn.Append("· ").Append(w).Append('\n');
+            }
+            warn.Append("\n若按键仍失灵,可尝试重启电脑;细节见 %TEMP%\\KeepAwake_app.log。");
+            MessageBox.Show(warn.ToString(), "键盘按键失灵修复",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        // 全成功:若有可疑项一并提示(不阻断),否则简单确认
+        string ok = sb.ToString() + "\n请试一下刚才失灵的按键。若仍无效,可重启电脑再观察。";
+        if (r.Warnings.Count > 0) {
+            ok += "\n\n另有一项【未改动、仅提示】:\n";
+            foreach (var w in r.Warnings) ok += "· " + w + "\n";
+        }
+        MessageBox.Show(ok, "键盘按键失灵修复", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // ==== 开机自启(HKCU Run,免管理员) ====
