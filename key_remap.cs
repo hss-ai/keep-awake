@@ -18,6 +18,18 @@
 //     down 之后、物理 0x5B 还没抬的 250ms 内,F23 才到 = 迟到的三件套:抬掉补发
 //     的左 Win、补抬已直通出去的 Shift、改注右 Ctrl。反悔只认 F23(0x86 是人手
 //     不会按的机器码)——Shift 迟到可能是 Win+Shift+S 的人类组合,不能动。
+//   → 持键状态自愈(v1.4.15,用户实测"开着本软件左 Shift 偶发失效、关软件恢复"的
+//     根因):状态机的"按住"状态(trioActive/补发左Win/F2/右Win)只在物理 keyup
+//     到达时清除,而 keyup 可能永远到不了——无线键盘/接收器丢包、按住期间 UAC
+//     安全桌面或管理员窗口接管键盘流(未提权钩子收不到)、系统睡眠都会弄丢它。
+//     trioActive 一旦卡死,之后所有左 Shift(0xA0)/F23/左Win 事件被无条件吞掉
+//     ——左 Shift 全局失效(左右/内外键盘通杀,钩子是全局的),右 Shift(0xA1)
+//     不在过滤表所以正常,关软件卸钩子即恢复;2026-10-16 曾误判此症状为"驱动栈
+//     偶发卡住"。自愈判据:物理按住期间键盘固件持续发自动重复 down(实测 ~33ms
+//     一发,首延迟 ~500ms),故 StaleHoldMs 内零事件的持键状态只可能是"键已抬、
+//     事件已丢"——下一个任意真实按键到来时先补抬欠账清状态,再按正常路径分发
+//     当前键;该键自己的重复 down 只刷新计时不触发自愈(按住跨过 UAC 等场景,
+//     重复恢复到达说明键还按着,不误杀)。
 //
 // 机制(两条映射共用一个 WH_KEYBOARD_LL 钩子,各自独立开关):
 //   1) 低级钩子拦在全系统键盘流最前面,装在独立线程(自有 GetMessage 消息循环):
@@ -79,6 +91,8 @@ internal sealed class KeyRemapper : IDisposable {
     private const uint MAPVK_VK_TO_VSC = 0;   // MapVirtualKey:VK → 扫描码
     private const int PendingWindowMs = 25;       // 三件套伴随键的判定窗(实测 +10ms/+20ms 到达)
     private const int LateGraceMs = 250;          // 补发左Win后的反悔宽限:迟到的 F23 仍可改判三件套
+    private const int StaleHoldMs = 1500;         // 持键状态零事件看门狗(见头注"持键状态自愈"):长按
+                                                  // 自动重复 ~33ms/发+首延迟 ~500ms,1.5s 零事件=keyup 已丢
 
     private static readonly UIntPtr MagicExtra = new UIntPtr(0x4B415741); // "KAWA"
     private static readonly IntPtr MagicPtr = new IntPtr(0x4B415741);
@@ -161,6 +175,11 @@ internal sealed class KeyRemapper : IDisposable {
     private int lwinDownTick;   // 0x5B 按下的 TickCount(反悔宽限计时;int 回绕用不检查减法)
     private bool trioActive;    // 判定为三件套:0x5B 吞着,后续 0xA0/0x86 伴随键也吞
     private bool trioWeCtrl;    // 三件套映射补按的右 Ctrl 还欠抬起
+    // 持键状态自愈(v1.4.15)的计时戳:对应原键最近一次事件(按下/自动重复)的
+    // TickCount,仅钩子线程读写。按住期间重复流持续刷新;长期不更新=物理 keyup 已丢。
+    private int f2ActTick;      // F2 最近事件(F2 持键看门狗)
+    private int rwinActTick;    // 0x5C 最近事件(标准右Win 持键看门狗)
+    private int lwin5bTick;     // 0x5B 最近 down(三件套/补发左Win 持键看门狗)
 
     public KeyRemapper() {
         proc = HookCallback;
@@ -253,6 +272,7 @@ internal sealed class KeyRemapper : IDisposable {
         KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
         if (k.ExtraInfo == MagicPtr)
             return CallNextHookEx(hook, nCode, wParam, lParam);   // 自家注入的一律放行
+        HealStuckHolds(k.VkCode);   // 任何真实按键先过持键看门狗(v1.4.15,见其函数注)
         uint msg = unchecked((uint)wParam.ToInt64());
         bool downMsg = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         bool upMsg = msg == WM_KEYUP || msg == WM_SYSKEYUP;
@@ -268,6 +288,7 @@ internal sealed class KeyRemapper : IDisposable {
     // F2 → Ctrl+W。返回 true = 吞掉本事件。
     private bool HandleF2(bool downMsg, bool upMsg) {
         if (downMsg) {
+            f2ActTick = Environment.TickCount;   // 持键看门狗计时(自动重复也走这里刷新)
             if (!f2Enabled) return false;   // 映射已关:原样放行(keyup 侧仍会认账)
             if (!f2Down) {                  // 首次按下才发组合;自动重复只吞不发
                 f2Down = true;
@@ -290,6 +311,7 @@ internal sealed class KeyRemapper : IDisposable {
     // 标准右 Win(0x5C)→ 右 Ctrl 直映射(用户键盘不发此码,换标准键盘时生效)。
     private bool HandleRWin(bool downMsg, bool upMsg) {
         if (downMsg) {
+            rwinActTick = Environment.TickCount;  // 持键看门狗计时(自动重复也走这里刷新)
             if (!winEnabled) return false;
             if (!rwinDown) {
                 rwinDown = true;
@@ -313,6 +335,7 @@ internal sealed class KeyRemapper : IDisposable {
     // 拖过 25ms 窗(用户实测"Win(右)→Ctrl(右)未生效"的根因)。
     private bool HandleTrioLWin(bool downMsg, bool upMsg) {
         if (downMsg) {
+            lwin5bTick = Environment.TickCount;   // 5B 看门狗计时(长按的自动重复也走这里)
             if (!winEnabled) return false;
             if (trioActive) return true;        // 长按右侧键:0x5B 自动重复,直接吞
             // 已补发过左 Win(物理还没抬):此刻的 5B down 只能是同一键的自动重复——
@@ -406,6 +429,41 @@ internal sealed class KeyRemapper : IDisposable {
         lwinReplayed = true;
         SendKey(VkLWin, false);
         AppLog.Write("键映射:左Win判定窗超时,原样补发左Win(反悔宽限 " + LateGraceMs + "ms)");
+    }
+
+    // 持键状态看门狗(v1.4.15,根因分析见头注"持键状态自愈"):物理 keyup 丢失会让
+    // "按住"状态无限期卡死——trioActive 卡死即用户实测的「左 Shift 偶发失效(右
+    // Shift 正常)、关闭软件才恢复」(0xA0 事件被 HandleTrioSide 无条件吞)。物理
+    // 按住期间键盘固件持续发自动重复 down,因此 StaleHoldMs 内零事件 = 物理键早已
+    // 抬起、keyup 在无线链路/安全桌面/睡眠中丢失——补抬欠账、清状态,让当前按键
+    // 按正常路径走。触发时机 = 任意真实按键到来;但当前事件正是该状态的原键时只
+    // 刷新不清理(重复 down 恢复到达说明键还按着,按住跨过 UAC 等场景不误杀)。
+    // 正常持键时重复流每 ~33ms 刷新计时,看门狗永不误触。
+    private void HealStuckHolds(uint vk) {
+        int now = Environment.TickCount;
+        if (vk != VkLWin) {   // 0x5B 自己的事件交给各分支正常处理(重复 = 还按着)
+            if (trioActive && now - lwin5bTick > StaleHoldMs) {
+                ReleaseTrioHeld();
+                AppLog.Write("键映射:三件套 " + StaleHoldMs + "ms 无 5B 事件,物理 keyup 疑丢失,自愈抬右Ctrl(左Shift恢复直通)");
+            }
+            if (lwinReplayed && now - lwin5bTick > StaleHoldMs) {
+                lwinReplayed = false;
+                graceStrayShift = false;
+                SendKey(VkLWin, true);
+                AppLog.Write("键映射:补发左Win " + StaleHoldMs + "ms 无 5B 事件,物理 keyup 疑丢失,自愈补抬左Win");
+            }
+            if (lwinPending && now - lwinDownTick > StaleHoldMs) {
+                OnPendingTimeout();   // 判定线程投递彻底丢失的兜底(正常 25ms 内必到)
+            }
+        }
+        if (vk != VkF2 && f2Down && now - f2ActTick > StaleHoldMs) {
+            ReleaseF2Held();
+            AppLog.Write("键映射:F2 " + StaleHoldMs + "ms 无重复,物理 keyup 疑丢失,自愈抬 W/Ctrl");
+        }
+        if (vk != VkRWin && rwinDown && now - rwinActTick > StaleHoldMs) {
+            ReleaseRwinHeld();
+            AppLog.Write("键映射:右Win " + StaleHoldMs + "ms 无重复,物理 keyup 疑丢失,自愈抬右Ctrl");
+        }
     }
 
     /// <summary>抬起 F2 映射注入且尚未抬起的键(仅钩子线程调用)。</summary>

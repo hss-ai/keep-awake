@@ -16,7 +16,8 @@
 //       Keyboard Manager;两条映射各自独立开关,选择持久化 KeepAwakePrefs
 //       v1.4.13。Win(右)含三件套识别:用户
 //       无线键盘把右侧键合成为 Win左+Shift左+F23(实测),钩子按"0x5B 暂扣
-//       25ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留) /
+//       25ms 内有无伴随键"区分它与真左 Win——右键变 Ctrl、左 Win 原义保留;
+//       持键状态 keyup 丢失有 1.5s 零事件看门狗自愈 v1.4.15,详见 key_remap.cs) /
 //     ✔开机自启(HKCU Run 键,免管理员,exe 挪窝自愈)/
 //     ✔启动时静音(每次进程真正跑起来——手动双击或开机自启——都把默认播放设备
 //       SetMute 静音:幂等"设置"非切换、不改音量值,取消静音即恢复原音量;
@@ -338,7 +339,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.14)");
+        AppLog.Write("启动(v1.4.15)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮

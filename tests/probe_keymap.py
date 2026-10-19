@@ -31,6 +31,13 @@
        直通配对,无任何目标键注入(设计边界,不再反悔);
   N) 真左Win 长按(v1.4.10 回归):超时补发后的自动重复 down 全吞(录音链头仍可见),
      不再周期性重发 down;物理 up 直通配对(ESC 清开始菜单)。
+  O) 丢 keyup 卡死自愈(v1.4.15,用户实测"左Shift 失效、关软件恢复"的根因场景):
+     三件套只发 down 不发 up(模拟无线丢包/UAC 安全桌面吞掉抬起),1.8s(> 看门狗
+     1.5s)后按左 Shift → 看门狗应补抬右Ctrl(C↑K)并放行该 Shift。等待窗内人手
+     打字会提前触发自愈,C↑K 与 Shift 的相对次序不定 → 宽松判据(v1.4.15 前的旧
+     代码 C↑K 恒不出现——卡死吞 Shift 且永不补抬,必被此判据抓出);
+  P) 新鲜持键不误愈(v1.4.15 反向):三件套按住 0.5s(< 看门狗 1.5s)内按 Shift
+     仍按伴随键语义吞掉、5B↑ 正常还账 C↑K——证明看门狗不误伤正常长按。
 清理:杀被测 exe → 恢复已装版本。
 """
 import ctypes
@@ -388,6 +395,18 @@ SCENARIOS = [
     ("L", lambda: (trio_late(150, 200), time.sleep(0.3), tap(VK_ESCAPE))),  # 重度迟到,宽限内:反悔改判
     ("M", lambda: (trio_late(400, 500), time.sleep(0.3), tap(VK_ESCAPE))),  # 迟到超宽限:判真左Win,ESC 清开始菜单
     ("N", lambda: (lwin_hold(), time.sleep(0.3), tap(VK_ESCAPE))),          # 长按左Win:重复↓全吞(v1.4.10)
+    # O:三件套只发 down 不发 up = keyup 在无线链路/安全桌面丢失(v1.4.15 根因场景);
+    #   1.8s(> StaleHoldMs 1.5s)后 Shift↓ 触发看门狗:补抬 C↑K + 该 Shift 放行
+    ("O", lambda: (
+        send_key(VK_LWIN), time.sleep(0.01), send_key(VK_LSHIFT),   # 坐实三件套(注入 C↓K)
+        time.sleep(1.8),                                             # 零 5B 事件,持键状态超龄
+        tap(VK_LSHIFT))),                                            # 自愈 + 直通
+    # P:新鲜持键(< 1.5s)内 Shift 仍按伴随键吞、5B↑ 还账——看门狗不误伤正常长按
+    ("P", lambda: (
+        send_key(VK_LWIN), time.sleep(0.01), send_key(VK_LSHIFT),
+        time.sleep(0.5),
+        send_key(VK_LSHIFT), time.sleep(0.05),
+        send_key(VK_LWIN, up=True))),
 ]
 
 # 录音序列期望。T=测试注入的原键(录音钩子在链头先于 KeepAwake,原键可见);
@@ -437,11 +456,40 @@ EXPECTED = {
     # 重复补发)——本断言正是与其区分
     "N": [("down", "LWIN", "T"), ("down", "LWIN", "K"), ("down", "LWIN", "T"),
           ("down", "LWIN", "T"), ("up", "LWIN", "T")],
+    # P:新鲜持键(< 1.5s 看门狗)内的 Shift↓ 仍按伴随键语义吞(链头可见 T),5B↑ 还账
+    # C↑K 收尾;若看门狗误触会提前冒出 C↑K,精确序列即失配
+    "P": [("down", "LWIN", "T"), ("down", "SH", "T"), ("down", "C", "K"),
+          ("down", "SH", "T"), ("up", "LWIN", "T"), ("up", "C", "K")],
 }
 
 # 破坏性场景:输出含真实 W 键,必须由探针窗体持有前台(安全目的地)才允许注入。
 # 其余场景输出仅孤立 Ctrl 单键(H 弹一次开始菜单随即 ESC 清场),无破坏性。
-HARMFUL = {"A", "B", "C"}
+# O 例外:它把右 Ctrl 按住 1.8s 才自愈,期间人手打字会变成 Ctrl+组合键——同需前台守护。
+HARMFUL = {"A", "B", "C", "O"}
+
+
+def check_scenario_o(got):
+    """O 的宽松判据(等待窗 1.8s 内人手键可能提前触发自愈,故 C↑K 与 Shift 相对次序
+    不定):①头部为三件套坐实(LWIN↓T, SH↓T, C↓K);②自愈补抬 C↑K 恰好一次——旧代码
+    (v1.4.15 前)卡死吞 Shift 且永不补抬,此条必失配;③补抬之外还有完整的 Shift
+    按压对(SH↓T…SH↑T)——自愈后左 Shift 已直通。返回空串=通过,否则失配原因。"""
+    head = [("down", "LWIN", "T"), ("down", "SH", "T"), ("down", "C", "K")]
+    if got[:3] != head:
+        return "头部应为三件套坐实 %s,实录 %s" % (head, got[:3])
+    lifts = [i for i, g in enumerate(got) if g == ("up", "C", "K")]
+    if len(lifts) != 1:
+        return "自愈补抬右Ctrl 应恰好 1 次,实录 %d 次(0 次=卡死未自愈)" % len(lifts)
+    sh_downs = [i for i, g in enumerate(got) if g == ("down", "SH", "T") and i >= 3]
+    if not sh_downs:
+        return "自愈触发键 Shift↓ 不在实录中"
+    last_down = sh_downs[-1]
+    if not any(g == ("up", "SH", "T") and i > last_down for i, g in enumerate(got)):
+        return "自愈后的 Shift↑ 不在实录中(按压对不完整)"
+    return ""
+
+
+# 宽松判据场景:精确序列之外的特殊核对(键:场景 tag,值:核对函数,返回空串=通过)
+TOLERANT_CHECKS = {"O": check_scenario_o}
 
 
 def main():
@@ -497,6 +545,11 @@ def main():
                     print("  [%s] SKIP(前台被占用,破坏性场景未注入)" % tag)
                     continue
                 got = sections.get(tag, [])
+                if tag in TOLERANT_CHECKS:
+                    err = TOLERANT_CHECKS[tag](got)
+                    if err:
+                        failures.append("%s %s" % (tag, err))
+                    continue
                 want = EXPECTED[tag]
                 show = " ".join("%s:%s:%s" % g for g in got) or "(空)"
                 print("  [%s] %s" % (tag, show))
