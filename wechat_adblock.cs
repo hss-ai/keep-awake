@@ -106,8 +106,10 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
 
     public WechatAdblockSupervisor(bool startEnabled) {
         enabled = startEnabled;
+        // 清掉上一个实例(或旧 python guard)留下的 mitmdump 孤儿:它占着 443,
+        // 既会挡住本实例拉起新的,也会让"关"态下广告其实没关
+        KillStrayMitmdump();
         if (startEnabled && BackendPresent()) {
-            KillStrayMitmdump();      // 接管旧 guard / 上次残留的 mitmdump
             takeoverAt = DateTime.Now;
         }
         loopThread = new Thread(Loop);
@@ -132,6 +134,10 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             }
             else {
                 Log("公众号去广告:开启");
+                // 关闭期间中继占着 443,开启时必须先让路并清旧子进程——否则监督
+                // 循环看到「端口在监听」会误判健康,mitmdump 永远起不来(等于停在纯转发)
+                RelayStop();
+                KillChild();
                 if (BackendPresent() && takeoverAt == DateTime.MinValue) {
                     KillStrayMitmdump();
                     takeoverAt = DateTime.Now;
@@ -159,7 +165,8 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
                 }
                 else if (!enabled) {
                     KillChild();
-                    if (!PortListening() && realIps.Count > 0) {
+                    // 中继只在 mitmdump 真的不在时接管(否则两个抢 443)
+                    if (!MitmdumpOwnsPort() && !PortListening() && realIps.Count > 0) {
                         RelayStart();
                     }
                 }
@@ -172,9 +179,14 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     }
 
     void SuperviseMitmdump() {
-        if (PortListening()) {
+        // 端口在监听还不够:关闭期间起的中继也是"在监听",但它不做注入。
+        // 所以要求监听者确实是 mitmdump(否则先让路再拉新的)
+        if (PortListening() && MitmdumpOwnsPort()) {
             portFails = 0;
             return;
+        }
+        if (PortListening()) {
+            Log("443 由降级中继占用,让路给 mitmdump");
         }
         // 端口死了:先让路给 mitmdump(中继停掉),再(重)拉子进程
         RelayStop();
@@ -238,15 +250,121 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     }
 
     static void KillStrayMitmdump() {
+        // taskkill /IM 只认镜像名;venv 里的 mitmdump.exe 是 uv shim,真身进程名是
+        // python.exe → 两条路都走:按镜像名杀 + 按命令行特征(our addon)杀
         try {
             var psi = new ProcessStartInfo("taskkill", "/IM mitmdump.exe /F") {
                 CreateNoWindow = true,
                 UseShellExecute = false,
             };
             Process.Start(psi);
-            Thread.Sleep(1500);
         }
         catch {
+        }
+        try {
+            foreach (int pid in FindPidsByCommandLine("wechat_adblock.py")) {
+                try {
+                    Process.GetProcessById(pid).Kill();
+                }
+                catch {
+                }
+            }
+        }
+        catch {
+        }
+        Thread.Sleep(1500);
+    }
+
+    // 按命令行子串找 pid(wmic;找不到返回空)
+    static List<int> FindPidsByCommandLine(string needle) {
+        var hits = new List<int>();
+        try {
+            var psi = new ProcessStartInfo("wmic",
+                "process get ProcessId,CommandLine /format:csv") {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            string outText = Process.Start(psi).StandardOutput.ReadToEnd();
+            foreach (string line in outText.Split('\n')) {
+                if (line.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var cells = line.Split(',');
+                for (int i = 0; i < cells.Length; i++) {
+                    int pid;
+                    if (int.TryParse(cells[i].Trim(), out pid) && pid > 0) {
+                        if (!hits.Contains(pid)) hits.Add(pid);
+                        break;
+                    }
+                }
+            }
+        }
+        catch {
+        }
+        return hits;
+    }
+
+    // 443 的监听者是不是 mitmdump:按 TCP 连接的对端本机端口反查 owning pid 的进程名。
+    // 走 netstat 文本解析(免 WMI 依赖);拿不到就返回 false(保守=重新拉起,最多一次抖动)
+    static bool MitmdumpOwnsPort() {
+        try {
+            var psi = new ProcessStartInfo("netstat", "-ano") {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            string outText = Process.Start(psi).StandardOutput.ReadToEnd();
+            foreach (string line in outText.Split('\n')) {
+                if (line.IndexOf("127.0.0.1:443") < 0) continue;
+                if (line.IndexOf("LISTENING") < 0 && line.IndexOf("ESTABLISHED") < 0) continue;
+                var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5) continue;
+                int pid;
+                if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                // 进程名不可靠:venv 里的 mitmdump.exe 是 uv 的 shim,真身进程名是
+                // python.exe(实测 3.11),只能按命令行特征认:mitmdump + 我们的 addon
+                if (LooksLikeMitmdump(pid)) return true;
+            }
+        }
+        catch {
+        }
+        return false;
+    }
+
+    // 是不是我们的 mitmdump:命令行里同时出现 mitmdump 与 wechat_adblock.py
+    static bool LooksLikeMitmdump(int pid) {
+        try {
+            using (var p = Process.GetProcessById(pid)) {
+                string name = p.ProcessName;
+                if (name != null && name.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+        }
+        catch {
+        }
+        try {
+            var psi = new ProcessStartInfo("wmic", "process where processid=" + pid +
+                " get CommandLine /value") {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            string cmd = Process.Start(psi).StandardOutput.ReadToEnd();
+            if (cmd.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                cmd.IndexOf("wechat_adblock", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        catch {
+        }
+        return false;
+    }
+
+    static string ProcessNameOf(int pid) {
+        try {
+            using (var p = Process.GetProcessById(pid))
+                return p.ProcessName;
+        }
+        catch {
+            return null;
         }
     }
 
