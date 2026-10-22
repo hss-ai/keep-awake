@@ -39,6 +39,7 @@ SRC_FILES = [
     os.path.join(HERE, "shortcut_arrow.cs"),        # 去除快捷方式小箭头(HKLM Shell Icons\29)
     os.path.join(HERE, "audio_mute.cs"),            # 启动时静音(Core Audio COM 直调 IAudioEndpointVolume)
     os.path.join(HERE, "keyboard_reset.cs"),        # 键盘按键失灵一键修复(pnputil 重枚举 + 清异常开关)
+    os.path.join(HERE, "wechat_adblock.cs"),        # 公众号文章去广告守护(mitmdump 保活+模板补丁+降级中继,v1.5.0)
 ]
 MANIFEST = os.path.join(HERE, "app.manifest")       # dpiAware=true:进程从头 system DPI aware
 BUILD_DIR = os.path.join(HERE, "build")

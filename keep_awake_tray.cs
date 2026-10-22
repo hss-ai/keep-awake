@@ -327,6 +327,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miKeymapWin; // └ Win(右) → Ctrl(右)
     readonly ToolStripMenuItem miAutoStart;
     readonly ToolStripMenuItem miMuteStartup;  // 启动时静音(默认开,持久化 HKCU)
+    readonly ToolStripMenuItem miAdblock;      // 公众号文章去广告(v1.5.0,KeepAwake 托管 #196 守卫层)
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
     readonly ToolStripMenuItem miKeyboardReset;  // 键盘按键失灵一键修复(v1.4.14)
@@ -336,10 +337,11 @@ internal sealed class TrayContext : ApplicationContext {
     readonly Icon iconOff;
     readonly ExplorerTabMerger merger;   // 资源管理器单窗口合并(默认开)
     readonly KeyRemapper remapper;       // 全局键映射(两条,默认开)
+    readonly WechatAdblockSupervisor adblock;  // 公众号去广告守护(mitmdump 保活+模板补丁+降级中继)
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.4.15)");
+        AppLog.Write("启动(v1.5.0)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -365,6 +367,8 @@ internal sealed class TrayContext : ApplicationContext {
         miAutoStart.Click += OnToggleAutoStart;
         miMuteStartup = new ToolStripMenuItem("启动时静音");
         miMuteStartup.Click += OnToggleMuteStartup;
+        miAdblock = new ToolStripMenuItem("公众号文章去广告(微信)");
+        miAdblock.Click += OnToggleAdblock;
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
         miArrow.Click += OnToggleArrow;
         miKeyboardReset = new ToolStripMenuItem("键盘按键失灵…修复");
@@ -383,6 +387,7 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(miKeymap);
         menu.Items.Add(miAutoStart);
         menu.Items.Add(miMuteStartup);
+        menu.Items.Add(miAdblock);
         menu.Items.Add(miMore);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miExit);
@@ -428,6 +433,22 @@ internal sealed class TrayContext : ApplicationContext {
 
         miAutoStart.Checked = AutoStartEnabled();
         if (miAutoStart.Checked) SetAutoStart(true); // 路径自愈:exe 挪窝后指向当前实例
+
+        // 公众号文章去广告(v1.5.0):三层防线的守卫层由本进程托管(知识库 #196)。
+        // 后端(mitmproxy venv+CA+payload.htm)缺失则功能整体停用置灰;开关关闭 =
+        // 杀 mitmdump 走纯转发降级(文章可用、广告回来),不动 hosts/CA。
+        bool adblockBackend = WechatAdblockSupervisor.BackendPresent();
+        bool adblockWanted = WechatAdblockPref.Get();
+        miAdblock.Checked = adblockBackend && adblockWanted;
+        if (!adblockBackend) {
+            miAdblock.Enabled = false;
+            AppLog.Write("公众号去广告: 后端缺失(" + WechatAdblockSupervisor.BackendDir()
+                         + "),功能停用");
+        }
+        else if (!adblockWanted) {
+            AppLog.Write("公众号去广告: 按记住的开关关闭(纯转发降级)");
+        }
+        adblock = new WechatAdblockSupervisor(miAdblock.Checked);
 
         // 启动时静音:手动双击/开机自启走的是同一条路,都在这里;Mutex 挡掉的
         // 重复启动到不了这里,不会二次静音。开关关着就完全不碰音频。
@@ -705,6 +726,17 @@ internal sealed class TrayContext : ApplicationContext {
         MuteAtStartupPref.Set(miMuteStartup.Checked);
     }
 
+    void OnToggleAdblock(object sender, EventArgs e) {
+        // 开 = mitmdump 反代+模板补丁;关 = 杀 mitmdump 走纯转发降级(文章可用、
+        // 广告回来)。hosts/CA 属装机层不动,重开即恢复
+        miAdblock.Checked = !miAdblock.Checked;
+        WechatAdblockPref.Set(miAdblock.Checked);
+        adblock.Enabled = miAdblock.Checked;
+        AppLog.Write(miAdblock.Checked
+            ? "公众号去广告: 开启(mitmdump 反代+模板补丁)"
+            : "公众号去广告: 关闭(纯转发降级)");
+    }
+
     void TrayMouseClick(object sender, MouseEventArgs e) {
         if (e.Button == MouseButtons.Left) OnToggleOn(sender, e);
     }
@@ -751,6 +783,7 @@ internal sealed class TrayContext : ApplicationContext {
         AppLog.Write("退出");
         remapper.Dispose();
         merger.Dispose();
+        adblock.Dispose();   // 杀 mitmdump 子进程+停中继;下次启动守护随托盘回归
         timer.Stop();
         tray.Visible = false;
         tray.Dispose();
