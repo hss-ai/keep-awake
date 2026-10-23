@@ -23,6 +23,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Win32;
 
@@ -240,7 +241,7 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         lock (gate) {
             if (child != null) {
                 try {
-                    if (!child.HasExited) child.Kill();
+                    if (!child.HasExited) KillProcessTree(child.Id);
                 }
                 catch {
                 }
@@ -249,25 +250,36 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         }
     }
 
-    static void KillStrayMitmdump() {
-        // taskkill /IM 只认镜像名;venv 里的 mitmdump.exe 是 uv shim,真身进程名是
-        // python.exe → 两条路都走:按镜像名杀 + 按命令行特征(our addon)杀
+    // 杀整棵进程树:venv 里的 mitmdump.exe 是 uv shim,进程链是
+    //   mitmdump.exe(shim) → venv\Scripts\python.exe → uv\...\python.exe(真正监听 443 的)
+    // 只 Kill() shim 会留下真身继续占着 443(就是 v1.5.1 说的孤儿,只是没杀干净)。
+    static void KillProcessTree(int pid) {
         try {
-            var psi = new ProcessStartInfo("taskkill", "/IM mitmdump.exe /F") {
+            var psi = new ProcessStartInfo("taskkill", "/PID " + pid + " /T /F") {
                 CreateNoWindow = true,
                 UseShellExecute = false,
             };
-            Process.Start(psi);
+            Process.Start(psi).WaitForExit(5000);
         }
         catch {
+            try {
+                Process.GetProcessById(pid).Kill();
+            }
+            catch {
+            }
         }
+    }
+
+    static void KillStrayMitmdump() {
+        // 只杀「跑着我们 addon」的 mitmdump,不按镜像名无差别杀:
+        // venv 里的 mitmdump.exe 是 uv shim,真身进程名是 python.exe,
+        // 按命令行特征(wechat_adblock)认才准;也避免误杀别的项目的 mitmdump。
+        // 判定要同时含 mitmdump 与 wechat_adblock——只匹配后者会误伤
+        // 「命令行里恰好出现该路径」的无关进程(编辑器、shell 都会中招)。
         try {
-            foreach (int pid in FindPidsByCommandLine("wechat_adblock.py")) {
-                try {
-                    Process.GetProcessById(pid).Kill();
-                }
-                catch {
-                }
+            foreach (int pid in FindPidsByCommandLine("wechat_adblock")) {
+                if (!LooksLikeMitmdumpFresh(pid)) continue;
+                KillProcessTree(pid);
             }
         }
         catch {
@@ -275,32 +287,77 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         Thread.Sleep(1500);
     }
 
-    // 按命令行子串找 pid(wmic;找不到返回空)
+    // 按命令行子串找 pid
+    // 注意:Windows 11 已移除 wmic(实测本机 C:\Windows\System32\wbem\WMIC.exe 不存在),
+    // 依赖 wmic 会静默返回空 → 端口归属判断永远失败 → 监督循环误判「443 被降级中继占用」
+    // 反复让路(v1.5.1 实测刷屏)。改用 PowerShell CIM(系统自带,Win11 仍在)。
     static List<int> FindPidsByCommandLine(string needle) {
         var hits = new List<int>();
         try {
-            var psi = new ProcessStartInfo("wmic",
-                "process get ProcessId,CommandLine /format:csv") {
+            // needle 里的单引号需转义,否则会破坏 PowerShell 字符串字面量
+            string safeNeedle = needle.Replace("'", "''");
+            var psi = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -NonInteractive -Command " +
+                "Get-CimInstance Win32_Process | Where-Object { " +
+                "$_.CommandLine -like '*" + safeNeedle + "*' } | " +
+                "ForEach-Object { $_.ProcessId }") {
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
             };
             string outText = Process.Start(psi).StandardOutput.ReadToEnd();
             foreach (string line in outText.Split('\n')) {
-                if (line.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                var cells = line.Split(',');
-                for (int i = 0; i < cells.Length; i++) {
-                    int pid;
-                    if (int.TryParse(cells[i].Trim(), out pid) && pid > 0) {
-                        if (!hits.Contains(pid)) hits.Add(pid);
-                        break;
-                    }
+                int pid;
+                if (int.TryParse(line.Trim(), out pid) && pid > 0) {
+                    if (!hits.Contains(pid)) hits.Add(pid);
                 }
             }
         }
         catch {
         }
         return hits;
+    }
+
+    // 取 pid 的命令行(wmic 已被 Win11 移除,同 FindPidsByCommandLine 改走 CIM)
+    // CIM 查询每次要起一个 PowerShell(~1s),监督循环 5s 一轮,故按 pid 缓存 30s。
+    static readonly Dictionary<int, string> cmdLineCache = new Dictionary<int, string>();
+    static readonly Dictionary<int, DateTime> cmdLineAt = new Dictionary<int, DateTime>();
+
+    static string CommandLineOf(int pid) {
+        lock (cmdLineCache) {
+            DateTime at;
+            string cached;
+            if (cmdLineCache.TryGetValue(pid, out cached) &&
+                cmdLineAt.TryGetValue(pid, out at) &&
+                (DateTime.Now - at).TotalSeconds < 30) {
+                return cached;
+            }
+        }
+        string cmd = CommandLineOfFresh(pid);
+        lock (cmdLineCache) {
+            cmdLineCache[pid] = cmd;
+            cmdLineAt[pid] = DateTime.Now;
+        }
+        return cmd;
+    }
+
+    // 不走缓存的版本:杀进程前必须拿最新命令行
+    static string CommandLineOfFresh(int pid) {
+        string cmd = "";
+        try {
+            var psi = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -NonInteractive -Command " +
+                "$p = Get-CimInstance Win32_Process -Filter 'ProcessId=" + pid + "'; " +
+                "if ($p) { $p.CommandLine }") {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            cmd = Process.Start(psi).StandardOutput.ReadToEnd();
+        }
+        catch {
+        }
+        return cmd;
     }
 
     // 443 的监听者是不是 mitmdump:按 TCP 连接的对端本机端口反查 owning pid 的进程名。
@@ -315,7 +372,9 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             string outText = Process.Start(psi).StandardOutput.ReadToEnd();
             foreach (string line in outText.Split('\n')) {
                 if (line.IndexOf("127.0.0.1:443") < 0) continue;
-                if (line.IndexOf("LISTENING") < 0 && line.IndexOf("ESTABLISHED") < 0) continue;
+                // 只认 LISTENING 那一条:ESTABLISHED 行是同端口的客户端连接,
+                // 会重复触发昂贵的命令行查询(CIM 每次 ~1s)
+                if (line.IndexOf("LISTENING") < 0) continue;
                 var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length < 5) continue;
                 int pid;
@@ -330,7 +389,7 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         return false;
     }
 
-    // 是不是我们的 mitmdump:命令行里同时出现 mitmdump 与 wechat_adblock.py
+    // 是不是我们的 mitmdump:命令行里同时出现 mitmdump 与 wechat_adblock
     static bool LooksLikeMitmdump(int pid) {
         try {
             using (var p = Process.GetProcessById(pid)) {
@@ -341,20 +400,32 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         }
         catch {
         }
+        // 进程名不可靠:venv 里的 mitmdump.exe 是 uv shim,真身进程名是 python.exe,
+        // 只能按命令行特征认:mitmdump + 我们的 addon(wmic 已被 Win11 移除,走 CIM)
+        string cmd = CommandLineOf(pid);
+        if (cmd.Length > 0 &&
+            cmd.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            cmd.IndexOf("wechat_adblock", StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
+        return false;
+    }
+
+    // 同 LooksLikeMitmdump,但绕过命令行缓存(杀进程前必须拿最新命令行)
+    static bool LooksLikeMitmdumpFresh(int pid) {
         try {
-            var psi = new ProcessStartInfo("wmic", "process where processid=" + pid +
-                " get CommandLine /value") {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-            };
-            string cmd = Process.Start(psi).StandardOutput.ReadToEnd();
-            if (cmd.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                cmd.IndexOf("wechat_adblock", StringComparison.OrdinalIgnoreCase) >= 0)
-                return true;
+            using (var p = Process.GetProcessById(pid)) {
+                string name = p.ProcessName;
+                if (name != null && name.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
         }
         catch {
         }
+        string cmd = CommandLineOfFresh(pid);
+        if (cmd.Length > 0 &&
+            cmd.IndexOf("mitmdump", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            cmd.IndexOf("wechat_adblock", StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
         return false;
     }
 
@@ -631,18 +702,27 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         foreach (string file in files) {
             try {
                 string html = File.ReadAllText(file, Encoding.UTF8);
-                if (html.IndexOf(PayloadMarker) >= 0) continue;
+                // 载荷更新后模板必须跟着更新:先前只判「含标记就跳过」,导致改了
+                // payload.htm(新增留言区选择器)模板永远停在旧载荷——2026-10-23 实锤。
+                // 改成:先剥掉旧载荷整段,再按当前载荷注入。
+                string stripped = StripPayload(html);
+                if (stripped == null) continue;                 // 不是我们打过补丁的模板
+                // 载荷首尾空白裁掉,保证「剥→注」幂等(否则每次重注多一个换行)
+                string payloadTrimmed = payload.Trim();
                 string injected;
-                int at = html.IndexOf("<head>");
+                int at = stripped.IndexOf("<head>");
                 if (at >= 0) {
                     at += 6;
-                    injected = html.Insert(at, payload);
+                    injected = stripped.Insert(at, payloadTrimmed);
                 }
                 else {
-                    int close = html.IndexOf("</head>");
+                    int close = stripped.IndexOf("</head>");
                     if (close < 0) continue;
-                    injected = html.Insert(close, payload);
+                    injected = stripped.Insert(close, payloadTrimmed);
                 }
+                // 内容已等价就别写盘:模板是 12MB 级的文件,每分钟重写 18 份
+                // 会把磁盘和 IO 拖垮(且内容没变,纯浪费)
+                if (injected == html) continue;
                 string tmp = file + ".adblock.tmp";
                 File.WriteAllText(tmp, injected, new UTF8Encoding(false));
                 File.Replace(tmp, file, null);
@@ -652,6 +732,40 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
                 Log("模板补丁失败 " + file + ": " + ex.Message);
             }
         }
+    }
+
+    // 剥掉已注入的旧载荷块;不是我们打的补丁则返回 null
+    // 载荷结构固定:<style id="wechat-adblock">…</style> + <script id="wechat-adblock-beacon">…</script>
+    static string StripPayload(string html) {
+        if (html.IndexOf(PayloadMarker) < 0) return null;
+        int styleAt = html.IndexOf("<style id=\"" + PayloadMarker + "\">");
+        if (styleAt < 0) return null;
+        int styleEnd = html.IndexOf("</style>", styleAt);
+        if (styleEnd < 0) return null;
+        styleEnd += 8;
+        string result = html.Substring(0, styleAt) + html.Substring(styleEnd);
+
+        int scriptAt = result.IndexOf("<script id=\"" + PayloadMarker + "-beacon\">");
+        if (scriptAt >= 0) {
+            int scriptEnd = result.IndexOf("</script>", scriptAt);
+            if (scriptEnd >= 0) {
+                scriptEnd += 9;
+                result = result.Substring(0, scriptAt) + result.Substring(scriptEnd);
+            }
+        }
+        // 与 python 侧 payload.strip_payload 保持逐字节一致(否则两侧会互相
+        // 「改写」模板:每轮各写 36 份 12MB 文件,纯 IO 浪费):
+        //   ① 3 个以上连续换行合并成 2 个;
+        //   ② 注入点(</head> 前)残留的空白行收成 1 个换行。
+        result = CollapseBlankLines(result, 3, 2);
+        result = Regex.Replace(result, @"[ \t]*\n[ \t]*\n(?=</head>)", "\n");
+        return result;
+    }
+
+    // 把 n 个及以上连续换行压成 m 个
+    static string CollapseBlankLines(string text, int n, int m) {
+        var rx = new Regex(@"\n{" + n + ",}");
+        return rx.Replace(text, new string('\n', m));
     }
 
     // ---- 日志:写后端 logs\guard.log(与 python 工具同约定,#196 文档指向它) ----
