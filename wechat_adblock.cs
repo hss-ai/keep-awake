@@ -180,6 +180,15 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     }
 
     void SuperviseMitmdump() {
+        // 载荷改了必须重启 mitmdump:addon 在启动时把 payload.htm 读进内存,
+        // 之后改文件不重启就一直用旧载荷(2026-10-23 实锤:加了底部广告选择器,
+        // 实抓文章页仍是旧 CSS,只剩留言区选择器)。
+        if (PayloadChanged()) {
+            Log("检测到 payload.htm 变更,重启 mitmdump 以加载新载荷");
+            RelayStop();
+            KillChild();
+            Thread.Sleep(1500);
+        }
         // 端口在监听还不够:关闭期间起的中继也是"在监听",但它不做注入。
         // 所以要求监听者确实是 mitmdump(否则先让路再拉新的)
         if (PortListening() && MitmdumpOwnsPort()) {
@@ -209,6 +218,30 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         }
         else {
             Log("mitmdump 未监听(fail #" + portFails + "),等待重试");
+        }
+    }
+
+    // payload.htm 的内容指纹(长度 + 修改时间);变了就要重启 mitmdump
+    string payloadStamp = "";
+    bool payloadStampInit = false;
+
+    bool PayloadChanged() {
+        try {
+            string path = Path.Combine(BackendDir(), "payload.htm");
+            var fi = new FileInfo(path);
+            if (!fi.Exists) return false;
+            string stamp = fi.Length.ToString() + "@" + fi.LastWriteTimeUtc.Ticks.ToString();
+            if (!payloadStampInit) {
+                payloadStamp = stamp;
+                payloadStampInit = true;
+                return false;
+            }
+            if (stamp == payloadStamp) return false;
+            payloadStamp = stamp;
+            return true;
+        }
+        catch {
+            return false;
         }
     }
 
