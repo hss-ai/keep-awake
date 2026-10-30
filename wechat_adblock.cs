@@ -776,8 +776,12 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
                 // 载荷更新后模板必须跟着更新:先前只判「含标记就跳过」,导致改了
                 // payload.htm(新增留言区选择器)模板永远停在旧载荷——2026-10-23 实锤。
                 // 改成:先剥掉旧载荷整段,再按当前载荷注入。
+                // ⚠️ StripPayload 返回 null = 「不含我们的 marker」= 全新模板
+                // (微信升级会下载新版本号模板,2026-10-30 实锤 8499560)——
+                // 这种必须当原文注入!v1.5.2 曾误写成 continue 跳过,导致
+                // 微信升级后的新模板永远裸奔、模板通道广告全回来。
                 string stripped = StripPayload(html);
-                if (stripped == null) continue;                 // 不是我们打过补丁的模板
+                if (stripped == null) stripped = html;
                 // 载荷首尾空白裁掉,保证「剥→注」幂等(否则每次重注多一个换行)
                 string payloadTrimmed = payload.Trim();
                 string injected;
