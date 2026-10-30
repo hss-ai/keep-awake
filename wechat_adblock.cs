@@ -189,6 +189,27 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             KillChild();
             Thread.Sleep(1500);
         }
+        // 僵死清场(2026-10-30 实锤,广告因此复发一上午):
+        // 探活(TcpClient 连不上)=false 但 netstat 里 443 仍挂着 LISTENING
+        // = 监听进程僵死(socket 在、不 accept)。此时降级中继也 bind 不上
+        // (端口被占),监督循环会「故障→降级→bind 失败」死循环 6120s+。
+        // 对策:连续 2 轮探活失败后,若 LISTENING 者是我们家族的 mitmdump →
+        // 杀整棵进程树,让下一轮重新拉起;不是我们家族的只记日志(不乱杀)。
+        if (!PortListening() && portFails >= 2) {
+            int listenerPid = FindPort443ListenerPid();
+            if (listenerPid > 0) {
+                if (LooksLikeMitmdumpFresh(listenerPid)) {
+                    Log("443 探活失败但 PID " + listenerPid +
+                        " 仍挂 LISTENING(僵死),强制清场杀树");
+                    KillProcessTree(listenerPid);
+                    Thread.Sleep(1500);
+                }
+                else {
+                    Log("443 探活失败且被无关进程 PID " + listenerPid +
+                        " 占用,无法自动清场");
+                }
+            }
+        }
         // 端口在监听还不够:关闭期间起的中继也是"在监听",但它不做注入。
         // 所以要求监听者确实是 mitmdump(否则先让路再拉新的)
         if (PortListening() && MitmdumpOwnsPort()) {
@@ -213,13 +234,22 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         }
         portFails++;
         if (portFails >= 6 && realIps.Count > 0) {
-            Log("mitmdump 持续故障 " + (portFails * 5) + "s,降级纯转发");
+            // 日志节流:降级状态下曾每 5s 刷一条,102 分钟刷了几百行
+            // 且毫无信息量;改为每 60s 最多记一次
+            if ((DateTime.Now - lastDegradeLog).TotalSeconds >= 60) {
+                Log("mitmdump 持续故障 " + (portFails * 5) + "s,降级纯转发");
+                lastDegradeLog = DateTime.Now;
+            }
             RelayStart();
         }
-        else {
+        else if ((DateTime.Now - lastDegradeLog).TotalSeconds >= 60) {
+            // 探活失败重试期间同样节流,避免无限刷屏
             Log("mitmdump 未监听(fail #" + portFails + "),等待重试");
+            lastDegradeLog = DateTime.Now;
         }
     }
+
+    DateTime lastDegradeLog = DateTime.MinValue;
 
     // payload.htm 的内容指纹(长度 + 修改时间);变了就要重启 mitmdump
     string payloadStamp = "";
@@ -396,6 +426,19 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     // 443 的监听者是不是 mitmdump:按 TCP 连接的对端本机端口反查 owning pid 的进程名。
     // 走 netstat 文本解析(免 WMI 依赖);拿不到就返回 false(保守=重新拉起,最多一次抖动)
     static bool MitmdumpOwnsPort() {
+        // 只认 LISTENING 那一条:ESTABLISHED 行是同端口的客户端连接,
+        // 会重复触发昂贵的命令行查询(CIM 每次 ~1s)
+        int pid = FindPort443ListenerPid();
+        if (pid <= 0) return false;
+        // 进程名不可靠:venv 里的 mitmdump.exe 是 uv 的 shim,真身进程名是
+        // python.exe(实测 3.11),只能按命令行特征认:mitmdump + 我们的 addon
+        return LooksLikeMitmdump(pid);
+    }
+
+    // netstat 里 127.0.0.1:443 的 LISTENING 者 pid(拿不到返回 -1)。
+    // 用途:①端口归属判定;②僵死清场——探活失败但 LISTENING 仍挂着,
+    // 说明监听进程僵死(socket 在、不 accept),得按 pid 直接杀。
+    static int FindPort443ListenerPid() {
         try {
             var psi = new ProcessStartInfo("netstat", "-ano") {
                 CreateNoWindow = true,
@@ -405,21 +448,16 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             string outText = Process.Start(psi).StandardOutput.ReadToEnd();
             foreach (string line in outText.Split('\n')) {
                 if (line.IndexOf("127.0.0.1:443") < 0) continue;
-                // 只认 LISTENING 那一条:ESTABLISHED 行是同端口的客户端连接,
-                // 会重复触发昂贵的命令行查询(CIM 每次 ~1s)
                 if (line.IndexOf("LISTENING") < 0) continue;
                 var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length < 5) continue;
                 int pid;
-                if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
-                // 进程名不可靠:venv 里的 mitmdump.exe 是 uv 的 shim,真身进程名是
-                // python.exe(实测 3.11),只能按命令行特征认:mitmdump + 我们的 addon
-                if (LooksLikeMitmdump(pid)) return true;
+                if (int.TryParse(parts[parts.Length - 1], out pid) && pid > 0) return pid;
             }
         }
         catch {
         }
-        return false;
+        return -1;
     }
 
     // 是不是我们的 mitmdump:命令行里同时出现 mitmdump 与 wechat_adblock
