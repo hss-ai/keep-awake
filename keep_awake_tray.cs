@@ -22,6 +22,11 @@
 //     ✔启动时静音(每次进程真正跑起来——手动双击或开机自启——都把默认播放设备
 //       SetMute 静音:幂等"设置"非切换、不改音量值,取消静音即恢复原音量;
 //       开关持久化 HKCU Software\KeepAwakePrefs 默认开,详见 audio_mute.cs) /
+//     ✔开盖唤醒时静音(v1.5.6:系统从睡眠/休眠恢复——开盖、电源键——即把音量
+//       先归零再静音,取消静音露出的也是 0 音量,公共场合开盖不放声;双层检测:
+//       时钟对账看门狗(墙钟 vs QueryUnbiasedInterruptTime,本机实证)+ 顶层窗口
+//       WM_POWERBROADCAST 广播捎带(现代待机上不可靠);成对触发 10s 去重;
+//       开关持久化 KeepAwakePrefs 默认开,详见 audio_mute.cs 与 WakeDetector) /
 //     更多工具▸✔去除快捷方式小箭头(非常用功能折叠进子菜单;切换时写 HKLM,
 //       自我提权拉一次性 --arrow 实例,UAC 弹一次,详见 shortcut_arrow.cs) /
 //     ▸键盘按键失灵…修复(v1.4.14:间歇性单键失灵的一键保守复位——重枚举键盘设备
@@ -316,6 +321,91 @@ static class PowerHibernateGuard {
     }
 }
 
+// ==== 唤醒检测(v1.5.6):开盖/电源键从睡眠(现代待机)或休眠恢复时触发「开盖唤醒时静音」 ====
+// 双层机制,按可靠性分工;为什么不走「正规」注册 API:本机 Win11 Insider 26300 实测
+// 电源通知注册一族整体损坏——user32!RegisterPowerSettingNotifications 导出不存在
+// (EntryPointNotFoundException,pinvoke.net 流传的签名是坑)、user32!
+// RegisterSuspendResumeNotification 导出在但一调即 AV(ctypes 裸调同炸,排除托管侧
+// 问题;AV 在 .NET 4+ 属不可捕获的损坏态异常,绝不能调)、powrprof!
+// PowerRegisterSuspendResumeNotification 恒返 87。另外微软文档明确 S0 现代待机机型
+// (本机即是,powercfg /a 无 S3)不注册收不到 WM_POWERBROADCAST 广播。
+//   1) 时钟对账看门狗(主层,本机实证可用):每 2s 比对墙钟增量与
+//      QueryUnbiasedInterruptTime 增量——后者刻意剔除系统在睡眠/休眠里度过的时段
+//      (含现代待机),两者差值超阈值即「刚从睡眠里醒来」。本机 51h 里 12.8h 的合盖
+//      过夜被它准确剔除(2026-11-01 对账实测)。睡眠期定时器不触发,醒来后第一拍
+//      即对出跳变,延迟 ≤ 定时间隔。
+//   2) WM_POWERBROADCAST 监听(副层,零成本捎带):不显示的顶层窗口收系统广播,
+//      在能收到的机型/构建上即收即触发,快过看门狗;收不到也就是白挂,无害。
+// 两层成对触发由 WakeMute 去重(10s 窗口);窗口消息与定时器 Tick 都在 UI 线程,
+// 回调里读菜单状态安全。覆盖边界:一切「从睡眠/休眠恢复」;若配置合盖不睡眠,
+// 纯开盖不经历睡眠则不触发(那也不是「从休眠中恢复」)。
+// ⚠看门狗已知误报面:NTP 大步校时/手动前拨时钟会产生同样的墙钟跳变——后果是一次
+//   多余的静音(本功能的良性失败面),阈值 5s 压概率。
+sealed class WakeDetector : NativeWindow {
+    [DllImport("kernel32.dll")]
+    static extern bool QueryUnbiasedInterruptTime(out ulong unbiasedTime);  // 100ns 单位
+
+    const int WM_POWERBROADCAST = 0x0218;
+    const int PBT_APMRESUMECRITICAL = 0x0006;
+    const int PBT_APMRESUMESUSPEND = 0x0007;
+    const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    const int WS_POPUP = unchecked((int)0x80000000);
+    const int WatchdogIntervalMs = 2000;
+    const long WakeGapThreshold100ns = 5 * 1000 * 1000 * 10;   // 墙钟-非偏向差 >5s 判为刚醒
+
+    readonly Action<string> onWake;
+    readonly System.Windows.Forms.Timer watchdog;   // 全限定:System.Threading.Timer 会撞名
+    DateTime lastWall = DateTime.UtcNow;
+    ulong lastUnbiased;
+
+    public WakeDetector(Action<string> onWake) {
+        this.onWake = onWake;
+        var cp = new CreateParams();
+        cp.Caption = "KeepAwakePowerSink";
+        cp.Style = WS_POPUP;                    // 不带 WS_VISIBLE:顶层窗口,但永不显示
+        cp.X = 0; cp.Y = 0; cp.Width = 0; cp.Height = 0;
+        CreateHandle(cp);                       // 只建窗口不注册:坏的是注册族 API,不是广播本身
+        ulong now;
+        QueryUnbiasedInterruptTime(out now);
+        lastUnbiased = now;
+        lastWall = DateTime.UtcNow;
+        watchdog = new System.Windows.Forms.Timer();
+        watchdog.Interval = WatchdogIntervalMs;
+        watchdog.Tick += OnWatchdogTick;
+        watchdog.Start();
+    }
+
+    void OnWatchdogTick(object sender, EventArgs e) {
+        ulong now;
+        QueryUnbiasedInterruptTime(out now);
+        DateTime wall = DateTime.UtcNow;
+        long wallDelta = (long)(wall - lastWall).TotalMilliseconds * 10000;   // 转 100ns 单位
+        ulong unbiasedDelta = now - lastUnbiased;
+        lastWall = wall;
+        lastUnbiased = now;
+        // 墙钟走满整段、非偏向时钟只计醒着的部分:差值超阈值=这段时间大半在睡眠里
+        long gap = wallDelta - (long)unbiasedDelta;
+        if (gap > WakeGapThreshold100ns) onWake("时钟对账");
+    }
+
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_POWERBROADCAST) {
+            int evt = m.WParam.ToInt32();
+            if (evt == PBT_APMRESUMEAUTOMATIC || evt == PBT_APMRESUMESUSPEND
+                || evt == PBT_APMRESUMECRITICAL) {
+                onWake("唤醒广播");
+            }
+        }
+        base.WndProc(ref m);
+    }
+
+    public void Shutdown() {
+        watchdog.Stop();
+        watchdog.Dispose();
+        if (Handle != IntPtr.Zero) DestroyHandle();
+    }
+}
+
 internal sealed class TrayContext : ApplicationContext {
 
     readonly NotifyIcon tray;    readonly ToolStripMenuItem miState;
@@ -327,6 +417,7 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ToolStripMenuItem miKeymapWin; // └ Win(右) → Ctrl(右)
     readonly ToolStripMenuItem miAutoStart;
     readonly ToolStripMenuItem miMuteStartup;  // 启动时静音(默认开,持久化 HKCU)
+    readonly ToolStripMenuItem miMuteWake;     // 开盖唤醒时静音(默认开,持久化 HKCU,v1.5.6)
     readonly ToolStripMenuItem miAdblock;      // 公众号文章去广告(v1.5.0,KeepAwake 托管 #196 守卫层)
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
@@ -338,10 +429,11 @@ internal sealed class TrayContext : ApplicationContext {
     readonly ExplorerTabMerger merger;   // 资源管理器单窗口合并(默认开)
     readonly KeyRemapper remapper;       // 全局键映射(两条,默认开)
     readonly WechatAdblockSupervisor adblock;  // 公众号去广告守护(mitmdump 保活+模板补丁+降级中继)
+    readonly WakeDetector wakeDetector;  // 唤醒检测(时钟对账看门狗+广播捎带 → 唤醒静音,v1.5.6)
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.5.5)");
+        AppLog.Write("启动(v1.5.6)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -367,6 +459,8 @@ internal sealed class TrayContext : ApplicationContext {
         miAutoStart.Click += OnToggleAutoStart;
         miMuteStartup = new ToolStripMenuItem("启动时静音");
         miMuteStartup.Click += OnToggleMuteStartup;
+        miMuteWake = new ToolStripMenuItem("开盖唤醒时静音");
+        miMuteWake.Click += OnToggleMuteWake;
         miAdblock = new ToolStripMenuItem("公众号文章去广告(微信)");
         miAdblock.Click += OnToggleAdblock;
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
@@ -387,6 +481,7 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(miKeymap);
         menu.Items.Add(miAutoStart);
         menu.Items.Add(miMuteStartup);
+        menu.Items.Add(miMuteWake);
         menu.Items.Add(miAdblock);
         menu.Items.Add(miMore);
         menu.Items.Add(new ToolStripSeparator());
@@ -454,6 +549,13 @@ internal sealed class TrayContext : ApplicationContext {
         // 重复启动到不了这里,不会二次静音。开关关着就完全不碰音频。
         miMuteStartup.Checked = MuteAtStartupPref.Get();
         if (miMuteStartup.Checked) StartupMute.Apply();
+
+        // 开盖唤醒时静音(v1.5.6):与「启动时静音」互补——那个管进程启动(开机/手动
+        // 双击),这个管系统唤醒(开盖/电源键从睡眠或休眠恢复)。窗口常开,事件到时
+        // 按当前开关决定动不动音频,会话中途切换无需重建;开关关着 = 事件白来,
+        // 完全不碰音频。
+        miMuteWake.Checked = MuteOnWakePref.Get();
+        wakeDetector = new WakeDetector(OnPowerWakeMute);
 
         miArrow.Checked = ShortcutArrowCleaner.IsEnabled(); // 小箭头状态以 HKLM 实况为准
 
@@ -726,6 +828,21 @@ internal sealed class TrayContext : ApplicationContext {
         MuteAtStartupPref.Set(miMuteStartup.Checked);
     }
 
+    // 电源事件回调(PowerEventWindow 的 WndProc 转发,跑在 UI 线程):只管看开关,
+    // 动音频的事(含去重与失败重试)全在 WakeMute 里。开盖与唤醒广播常成对到达,
+    // 同一次唤醒只生效一次。
+    void OnPowerWakeMute(string reason) {
+        if (!miMuteWake.Checked) return;
+        WakeMute.Apply(reason);
+    }
+
+    void OnToggleMuteWake(object sender, EventArgs e) {
+        // 纯偏好开关(与「启动时静音」同款):只翻持久化,不立刻动音频——
+        // 下次开盖唤醒生效与否由它决定
+        miMuteWake.Checked = !miMuteWake.Checked;
+        MuteOnWakePref.Set(miMuteWake.Checked);
+    }
+
     void OnToggleAdblock(object sender, EventArgs e) {
         // 开 = mitmdump 反代+模板补丁;关 = 杀 mitmdump 走纯转发降级(文章可用、
         // 广告回来)。hosts/CA 属装机层不动,重开即恢复
@@ -784,6 +901,7 @@ internal sealed class TrayContext : ApplicationContext {
         remapper.Dispose();
         merger.Dispose();
         adblock.Dispose();   // 杀 mitmdump 子进程+停中继;下次启动守护随托盘回归
+        wakeDetector.Shutdown();  // 停看门狗+销毁窗口(进程退出本身也会带走,这里显式收尾)
         timer.Stop();
         tray.Visible = false;
         tray.Dispose();

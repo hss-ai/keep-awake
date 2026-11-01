@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""probe_mute.py — 端到端验证「启动时静音」:KeepAwake 一启动(手动双击/开机自启同一条路)
-就把当前默认播放设备 SetMute;开关关掉后启动完全不碰音频;已静音时启动幂等不炸。
+"""probe_mute.py — 端到端验证「启动时静音」与「开盖唤醒时静音」的音频语义:
+KeepAwake 一启动(手动双击/开机自启同一条路)就把当前默认播放设备 SetMute;
+开关关掉后启动完全不碰音频;已静音时启动幂等不炸;唤醒静音的「归零+静音」
+(ResetToMuted)直调语义正确。
 
 判据走独立探针 exe(probe_volume.cs + 生产同一份 audio_mute.cs 编译,直查
 IAudioEndpointVolume),不依赖 pycaw;探针侧自带 AppLog 同签名替身(audio_mute.cs
@@ -9,10 +11,13 @@ IAudioEndpointVolume),不依赖 pycaw;探针侧自带 AppLog 同签名替身(aud
 场景与判据:
   A) 开关开(出厂默认):先取消静音 → 启动 KeepAwake → 默认设备变 MUTED;
   B) 开关关(HKCU 写 0):先取消静音 → 启动 KeepAwake → 保持 UNMUTED(未被静音);
-  C) 幂等:保持 MUTED → 启动 KeepAwake → 仍 MUTED 且进程存活(重复设置无副作用)。
+  C) 幂等:保持 MUTED → 启动 KeepAwake → 仍 MUTED 且进程存活(重复设置无副作用);
+  D) 唤醒静音音频语义(v1.5.6):取消静音+音量抬到 0.30 → 直调 ResetToMuted →
+     必须 MUTED 且音量≈0。真实开盖/唤醒广播无法在测试里模拟,电源事件接线
+     (PowerEventWindow)留待真机开盖验证,这里锁的是「音量归零在静音之前」的顺序。
 
-清理:杀被测 exe → 恢复原静音态与原开关值;测试前 KeepAwake 在跑的重新拉起。
-注意:场景会短暂动到系统静音态,跑的时候别指望出声。
+清理:杀被测 exe → 恢复原静音态/原音量/原开关值;测试前 KeepAwake 在跑的重新拉起。
+注意:场景会短暂动到系统静音态与音量,跑的时候别指望出声。
 """
 import os
 import subprocess
@@ -50,7 +55,24 @@ static class ProbeVolume {
             Console.WriteLine(ok ? "OK" : "FAIL");
             return ok ? 0 : 1;
         }
-        Console.WriteLine("usage: probe_volume get | set on|off");
+        if (args.Length >= 1 && args[0] == "getvol") {
+            float? v = SystemMute.GetMasterVolumeScalar();
+            if (v == null) { Console.WriteLine("UNKNOWN"); return 3; }
+            Console.WriteLine(v.Value.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
+            return 0;
+        }
+        if (args.Length >= 2 && args[0] == "setvol") {
+            float lvl = float.Parse(args[1], System.Globalization.CultureInfo.InvariantCulture);
+            bool ok = SystemMute.SetMasterVolumeScalar(lvl);
+            Console.WriteLine(ok ? "OK" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (args.Length >= 1 && args[0] == "reset") {
+            bool ok = SystemMute.ResetToMuted();
+            Console.WriteLine(ok ? "OK" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        Console.WriteLine("usage: probe_volume get | set on|off | getvol | setvol N | reset");
         return 2;
     }
 }
@@ -134,10 +156,11 @@ def main():
     if initial != "MUTED" and initial != "UNMUTED":
         print("本机无音频设备(端点查询返回 %s),SKIP" % initial)
         return 0
+    orig_vol = probe(probe_exe, "getvol")   # 场景 D 会动音量,先存原值好在清理时恢复
     orig_pref = pref_get()
     orig_muted = initial == "MUTED"
     had_running = keep_awake_count() > 0
-    print("初始态:%s,开关=%s" % (initial, "开" if orig_pref else "关"))
+    print("初始态:%s,音量=%s,开关=%s" % (initial, orig_vol, "开" if orig_pref else "关"))
 
     failures = []
     try:
@@ -179,9 +202,35 @@ def main():
                 failures.append("C:幂等场景异常(状态 %s,存活 %s)" % (state, alive))
         else:
             failures.append("前置:设静音失败")
+
+        # D) 唤醒静音音频语义(v1.5.6):取消静音+音量 0.30 → 直调 ResetToMuted
+        #    → 必须 MUTED 且音量≈0(锁「先归零、再静音」顺序;真机开盖广播另验)
+        if probe(probe_exe, "set", "off") == "OK" and probe(probe_exe, "setvol", "0.30") == "OK":
+            if probe(probe_exe, "reset") != "OK":
+                failures.append("D:ResetToMuted 直调失败(端点不可写?)")
+            else:
+                state = probe(probe_exe, "get")
+                vol = probe(probe_exe, "getvol")
+                print("  [D] 归零+静音: %s,音量=%s" % (state, vol))
+                if state != "MUTED":
+                    failures.append("D:未静音(状态 %s)" % state)
+                else:
+                    try:
+                        if abs(float(vol)) > 0.001:
+                            failures.append("D:音量未归零(%s)" % vol)
+                    except ValueError:
+                        failures.append("D:音量读数异常(%s)" % vol)
+        else:
+            failures.append("前置:取消静音/设音量失败")
     finally:
         stop_keep_awake()
         probe(probe_exe, "set", "on" if orig_muted else "off")  # 恢复原静音态
+        # 恢复原音量(驱动可能按步进量化,恢复到最近一格即可,不做精确断言)
+        try:
+            float(orig_vol)
+            probe(probe_exe, "setvol", orig_vol)
+        except ValueError:
+            pass
         pref_set(orig_pref)
         if had_running:
             os.startfile(exe)  # 脱离测试进程组,命令结束图标不消失

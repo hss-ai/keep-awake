@@ -104,6 +104,50 @@ static class SystemMute {
             return null;
         }
     }
+
+    /// <summary>把默认播放设备「音量归零 + 静音」(开盖唤醒场景,v1.5.6)。顺序刻意:
+    /// 先 SetMasterVolumeLevelScalar(0) 再 SetMute(1)——只静音不归零的话,取消静音
+    /// 会回到唤醒前的音量,公共场合开盖一按就放声;归零后再静音,取消静音露出的
+    /// 也是 0 音量,想出声自己按音量键加。</summary>
+    public static bool ResetToMuted() {
+        try {
+            IAudioEndpointVolume ep = Endpoint();
+            Guid ctx = Guid.Empty;
+            ep.SetMasterVolumeLevelScalar(0f, ref ctx);   // 先归零
+            ep.SetMute(true, ref ctx);                    // 再静音
+            return true;
+        } catch (Exception ex) {
+            AppLog.Write("音量归零静音失败: " + ex.Message);
+            return false;
+        }
+    }
+
+    // 下面两个是探针/测试通道(tests/probe_mute.py 直读直写主音量,验证归零语义),
+    // 生产路径不用——与 GetMuted 的存在理由同款。
+    /// <summary>读当前默认播放设备主音量(0~1 标量);异常返回 null。</summary>
+    public static float? GetMasterVolumeScalar() {
+        try {
+            IAudioEndpointVolume ep = Endpoint();
+            float v;
+            ep.GetMasterVolumeLevelScalar(out v);
+            return v;
+        } catch {
+            return null;
+        }
+    }
+
+    /// <summary>写当前默认播放设备主音量(0~1 标量);异常返回 false。</summary>
+    public static bool SetMasterVolumeScalar(float level) {
+        try {
+            IAudioEndpointVolume ep = Endpoint();
+            Guid ctx = Guid.Empty;
+            ep.SetMasterVolumeLevelScalar(level, ref ctx);
+            return true;
+        } catch (Exception ex) {
+            AppLog.Write("音量设置失败: " + ex.Message);
+            return false;
+        }
+    }
 }
 
 // 「启动时静音」开关持久化:刻意独立于电源护栏的 Software\KeepAwake 键——
@@ -152,6 +196,70 @@ static class StartupMute {
                 }
             }
             AppLog.Write("启动静音:多次重试仍失败(无音频设备?)");
+        });
+    }
+}
+
+// 「开盖唤醒时静音」开关持久化(v1.5.6):与启动静音同键同款,未写过 = 默认开。
+static class MuteOnWakePref {
+    const string RegPath = "Software\\KeepAwakePrefs";
+    const string ValueName = "MuteOnWake";
+
+    public static bool Get() {
+        try {
+            using (var key = Registry.CurrentUser.OpenSubKey(RegPath)) {
+                if (key == null) return true;                    // 未写过 = 默认开
+                return Convert.ToInt32(key.GetValue(ValueName, 1)) != 0;
+            }
+        } catch {
+            return true;
+        }
+    }
+
+    public static void Set(bool on) {
+        try {
+            using (var key = Registry.CurrentUser.CreateSubKey(RegPath)) {
+                key.SetValue(ValueName, on ? 1 : 0, RegistryValueKind.DWord);
+            }
+        } catch (Exception ex) {
+            AppLog.Write("开盖唤醒静音开关写入失败: " + ex.Message);
+        }
+    }
+}
+
+// 唤醒静音入口(v1.5.6):系统从睡眠/休眠恢复(开盖、电源键)或开盖通知一到,把音量
+// 归零再静音(SystemMute.ResetToMuted)。与 StartupMute 的两点差异:
+//   - 一拍唤醒常伴随多个广播相继到达(唤醒广播 + 开盖通知)——lastTrigger 10 秒去重
+//     (只由 UI 线程的 WndProc 回调链写入,无并发),busy 再挡住后台重试期间的再触发;
+//   - 唤醒初期音频服务未必就绪(休眠恢复尤其像一次冷启),沿用 5/15/30s 后台重试,
+//     仅在「尚未成功」时重试,成功即止——用户随后手动开声音不会被压回去。
+static class WakeMute {
+    static DateTime lastTrigger = DateTime.MinValue;
+    static int busy;                                   // 0=空闲 1=立即尝试或后台重试进行中
+
+    public static void Apply(string reason) {
+        DateTime now = DateTime.Now;
+        if ((now - lastTrigger).TotalSeconds < 10) return;   // 同一次唤醒的成对广播只做一次
+        lastTrigger = now;
+        if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+        if (SystemMute.ResetToMuted()) {
+            AppLog.Write("唤醒静音(" + reason + "):已生效(音量归零+静音)");
+            Interlocked.Exchange(ref busy, 0);
+            return;
+        }
+        System.Threading.Tasks.Task.Run((Action)delegate {
+            bool done = false;
+            int[] waits = { 5000, 15000, 30000 };
+            foreach (int ms in waits) {
+                Thread.Sleep(ms);
+                if (SystemMute.ResetToMuted()) {
+                    AppLog.Write("唤醒静音(" + reason + "):重试后已生效");
+                    done = true;
+                    break;
+                }
+            }
+            if (!done) AppLog.Write("唤醒静音(" + reason + "):多次重试仍失败(无音频设备?)");
+            Interlocked.Exchange(ref busy, 0);
         });
     }
 }
