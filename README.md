@@ -192,7 +192,7 @@ python keep_awake.py --quiet        # 不打印心跳行
 
 第七个托盘功能(v1.5.0,默认开;右键菜单 `公众号文章去广告(微信)` 随时关,选择会被记住)。灭掉微信 PC 4.x 里公众号文章的**文中广告卡片/文末横幅**(订阅号消息列表里的原生 UI 广告不在网页层,够不到)。
 
-本功能是「监督层」:真正的去广告引擎装在**后端目录**(默认 `E:\software\wechat-adblock`,可用 exe 同目录 `wechat-adblock-path.txt` 覆盖),含 mitmproxy venv、本地 CA、注入载荷与完整文档。后端缺失时菜单项自动置灰,KeepAwake 本体零新增依赖。
+本功能是「监督层」:真正的去广告引擎装在**后端目录**(默认 `E:\java\workspace_own\wechat-adblock`,可用 exe 同目录 `wechat-adblock-path.txt` 覆盖),含 mitmproxy venv、本地 CA、注入载荷与完整文档。后端缺失时菜单项自动置灰,KeepAwake 本体零新增依赖。
 
 - **开着时**:保活 mitmdump 反代(127.0.0.1:443,hosts 已把 `mp.weixin.qq.com` 指到本机)→ 广告接口清空 + 文章 HTML 注入隐藏 CSS;每分钟检查补丁微信 xworker 文章模板(聊天里打开的文章走模板不走网络);mitmdump 持续故障 30 秒后才降级纯转发(短暂抖动宁可文章慢几秒,也不让未注入的原始 HTML 灌进缓存)。
 - **关掉时**:杀 mitmdump、走纯 TCP 转发——文章照常打开、广告回来;hosts/CA 属装机层不动,重开即恢复。

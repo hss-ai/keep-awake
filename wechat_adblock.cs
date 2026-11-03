@@ -79,7 +79,7 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     }
 
     public static string BackendDir() {
-        return OverrideOr("wechat-adblock-path.txt", @"E:\software\wechat-adblock");
+        return OverrideOr("wechat-adblock-path.txt", @"E:\java\workspace_own\wechat-adblock");
     }
 
     public static bool BackendPresent() {
