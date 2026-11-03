@@ -96,6 +96,9 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private const uint EVENT_OBJECT_CREATE = 0x8000;
     private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     private const int OBJID_WINDOW = 0;
+    private const int SW_HIDE = 0;
+    private const int SW_SHOWNOACTIVATE = 4;   // 还原显示但不激活
+    private const int SW_SHOW = 5;
     private const int SW_RESTORE = 9;
     private const uint WM_CLOSE = 0x0010;
     private const int SW_MINIMIZE = 6;
@@ -273,6 +276,32 @@ internal sealed class ExplorerTabMerger : IDisposable {
         Log("新窗口 " + newHwnd + " 标题=" + GetTitle(newHwnd));
         Thread.Sleep(200);                                   // 轻微节流:上一轮合并刚结束 explorer 可能还在忙
 
+        // v1.5.8 顺滑:趁新窗刚冒头就藏掉,视觉当场交接给目标窗口——此前用户看到的是
+        // 「弹一扇窗→停 0.7~3s→突然消失→另一扇窗跳到眼前」三段跳动。只在确认存在合并
+        // 目标时藏(首窗/无目标不藏);轮询里持续按住可见性(explorer 创建后可能再
+        // SW_SHOW 一次)。所有「窗口保留」的放弃路径由外层 finally 统一还原可见
+        IntPtr earlyTarget = FindTargetWindow(newHwnd);
+        bool hidden = false;
+        bool fgWasNew = false;
+        if (earlyTarget != IntPtr.Zero) {
+            fgWasNew = GetForegroundWindow() == newHwnd;
+            ShowWindow(newHwnd, SW_HIDE);
+            hidden = true;
+            if (fgWasNew) ShowTargetToUser(earlyTarget);   // 焦点交接:新窗退场、目标同时进场
+            Log("早藏新窗 " + newHwnd + (fgWasNew ? "(焦点交接→" + earlyTarget + ")" : "(前台在别处,不交接)"));
+        }
+        bool keepHidden = false;
+        try {
+            MergeIntoExisting(newHwnd, hidden, fgWasNew, ref keepHidden);
+        } finally {
+            if (hidden && !keepHidden && IsWindow(newHwnd)) {
+                ShowWindow(newHwnd, SW_SHOW);
+                Log("还原早藏的窗口(合并未成) " + newHwnd);
+            }
+        }
+    }
+
+    private void MergeIntoExisting(IntPtr newHwnd, bool hidden, bool fgWasNew, ref bool keepHidden) {
         // 等 explorer 完成导航。两个终态:
         //   a) LocationURL 出现 file: 路径 → 文件系统路径;
         //   b) 空 URL 稳定 ~3 秒(标题也不再变)且窗口可见 → 虚拟文件夹(主页/此电脑)。
@@ -289,9 +318,10 @@ internal sealed class ExplorerTabMerger : IDisposable {
             string title = GetTitle(newHwnd);
             if (lastTitle != null && title != lastTitle) emptyRun = 0;   // 还在导航
             lastTitle = title;
+            if (hidden && IsWindowVisible(newHwnd)) ShowWindow(newHwnd, SW_HIDE);   // 按住早藏
             string probe = ComCall(1500, delegate() { return GetExplorerLocation(newHwnd); }, null);
             if (probe != null && probe.Length > 0) { path = probe; break; }
-            if (probe != null && IsWindowVisible(newHwnd)) emptyRun++;
+            if (probe != null && (hidden || IsWindowVisible(newHwnd))) emptyRun++;
             if (emptyRun >= 15) {                            // ~3s 稳定空 URL → 虚拟位置
                 // 虚拟位置(回收站/此电脑等)LocationURL 为空,但 Document.Folder.Self.Path
                 // 能拿到 ::{GUID}(2026-10-04 本机实测)——用它导航,新标签落在用户真想去的
@@ -300,7 +330,7 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 path = (shellPath != null && shellPath.StartsWith("::")) ? shellPath : "";
                 break;
             }
-            if (probe == null && IsWindowVisible(newHwnd) && title == HomeWindowTitle) {
+            if (probe == null && (hidden || IsWindowVisible(newHwnd)) && title == HomeWindowTitle) {
                 // 26H2 新行为(2026-11-03 实测):停在主页的窗口不再及时登记 ShellWindows
                 //(滞后可达小时级),probe 恒 null、emptyRun 分支永远走不到 → 整窗放弃合并
                 //(症状:「等待 8s 未见导航信息」)。标题稳定为主页 ~3s 且可见 → 按标题判
@@ -475,14 +505,23 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 same = GetTitle(newHwnd) == HomeWindowTitle;
                 Log("关窗前复核(标题判定): " + (same ? "仍在主页" : "已被接管"));
             }
-            if (same) {
-                PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            if (same && PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)) {
+                keepHidden = true;   // 已投出关窗:finally 不再还原显示(还原会让垂死窗口闪一下)
+            } else if (same) {
+                Log("WM_CLOSE 投递失败,保留窗口");
             } else {
                 Log("关窗前复核未通过(现值=" + (cur == null ? "null" : cur) + "),新窗可能已被用户接管,保留不关");
             }
         }
         Thread.Sleep(300);                       // 等关窗后的焦点归还尘埃落定
-        ShowTargetToUser(target);                // 还原最小化 + 尽力带到眼前(不注入按键)
+        if (fgWasNew || GetForegroundWindow() == target) {
+            ShowTargetToUser(target);            // 还原最小化 + 尽力带到眼前(不注入按键);
+                                                // 焦点交接时已置前过,这里是幂等收尾
+        } else {
+            // 用户在合并期间切去了别的应用:不把目标窗弹到前台抢焦点,只无激活还原
+            if (IsIconic(target)) ShowWindow(target, SW_SHOWNOACTIVATE);
+            Log("目标窗口不置前(用户已切走,不抢焦点)");
+        }
         Log("并入完成 " + target + (path.Length == 0 ? "(主页标签)" : " → " + path)
             + " 最终最小化=" + IsIconic(target) + " 合并后标签快照: " + TabsSnapshot(target));
         } finally {
@@ -642,9 +681,12 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 }
                 try {
                     // 实测(2026-10-04 隔离探针):Navigate2 对裸 "::{GUID}" 抛
-                    // "Value does not fall within the expected range",加 shell::: 前缀即可;
-                    // 文件系统路径原样传
-                    string navPath = path.StartsWith("::") ? "shell:::" + path : path;
+                    // "Value does not fall within the expected range",要拼成三冒号的
+                    // shell:::{GUID}。⚠️ 前缀是 "shell:" 不是 "shell:::"——path 自带
+                    // "::",再接三冒号会拼出四冒号畸形 URL,explorer 弹「无法找到
+                    // shell::::{…}」且 Navigate2 阻塞在错误框上(2026-11-03 实锤,此路
+                    // 历史上首次被真正走到即翻车);文件系统路径原样传
+                    string navPath = path.StartsWith("::") ? "shell:" + path : path;
                     long t0 = DateTime.Now.Ticks;
                     last.Navigate2(navPath, 0);        // 原地导航这条新开的主页标签
                     Log("NavigateEmptyTab: Navigate2 OK " + ((DateTime.Now.Ticks - t0) / 10000) + "ms → " + navPath);
