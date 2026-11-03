@@ -112,6 +112,8 @@ internal sealed class ExplorerTabMerger : IDisposable {
     private const ushort VK_RETURN = 0x0D;
     private const ushort VK_L = 0x4C;
     private const ushort VK_T = 0x54;
+    private const string HomeWindowTitle = "主文件夹 - 文件资源管理器";   // 主页(Home)窗口标题,26H2 中文系统实测
+    private const string HomeGuidPath = "::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}";   // 主页命名空间 GUID
     private const ushort VK_V = 0x56;
 
     private const string ExplorerWindowClass = "CabinetWClass";
@@ -278,7 +280,9 @@ internal sealed class ExplorerTabMerger : IDisposable {
         //    标题一变就重置耐心;提前断定虚拟会把合并出来的标签停在主页(v1.1.0 的 bug)。
         string path = null;
         string lastTitle = null;
+        bool homeByTitle = false;                            // 26H2:主页窗口不登记 ShellWindows,按标题判定
         int emptyRun = 0;
+        int homeTitleRun = 0;
         int poll = 0;
         for (; poll < 40; poll++) {                          // 最长 ~8 秒
             if (!IsWindow(newHwnd)) { Log("窗口已被关闭,放弃"); return; }
@@ -296,13 +300,24 @@ internal sealed class ExplorerTabMerger : IDisposable {
                 path = (shellPath != null && shellPath.StartsWith("::")) ? shellPath : "";
                 break;
             }
+            if (probe == null && IsWindowVisible(newHwnd) && title == HomeWindowTitle) {
+                // 26H2 新行为(2026-11-03 实测):停在主页的窗口不再及时登记 ShellWindows
+                //(滞后可达小时级),probe 恒 null、emptyRun 分支永远走不到 → 整窗放弃合并
+                //(症状:「等待 8s 未见导航信息」)。标题稳定为主页 ~3s 且可见 → 按标题判
+                // 主页;一旦导航去别处标题即变、run 归零重等(承 v1.1.0「提前断定虚拟」教训)
+                homeTitleRun++;
+                if (homeTitleRun >= 15) { path = HomeGuidPath; homeByTitle = true; break; }
+            } else {
+                homeTitleRun = 0;
+            }
             Thread.Sleep(200);
         }
         if (path == null) {
             Log("等待 " + (poll * 200 / 1000.0) + "s 未见导航信息,跳过合并(窗口保留)");
             return;
         }
-        Log("路径判定[" + poll + "轮]: " + (path.Length == 0 ? "(虚拟位置不可解析→主页标签)" : path));
+        Log("路径判定[" + poll + "轮]: " + (path.Length == 0 ? "(虚拟位置不可解析→主页标签)" : path)
+            + (homeByTitle ? "(标题判定:未登记 ShellWindows)" : ""));
 
         IntPtr target = FindTargetWindow(newHwnd);
         if (target == IntPtr.Zero) { Log("无既有窗口,保留为首窗"); return; }
@@ -454,6 +469,12 @@ internal sealed class ExplorerTabMerger : IDisposable {
             bool same = path.Length > 0
                 ? (cur != null && string.Equals(cur, path, StringComparison.OrdinalIgnoreCase))
                 : (cur != null && cur.Length == 0);   // 主页形态:能读出实体路径=已被接管
+            if (!same && homeByTitle && cur == null) {
+                // 标题判定来的主页窗口不在 ShellWindows 里,COM 读回恒 null——复核退化为
+                // 标题:仍是主页标题=未被接管可关;标题变了=用户导航去了别处,保窗
+                same = GetTitle(newHwnd) == HomeWindowTitle;
+                Log("关窗前复核(标题判定): " + (same ? "仍在主页" : "已被接管"));
+            }
             if (same) {
                 PostMessage(newHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             } else {
@@ -1059,16 +1080,46 @@ internal sealed class ExplorerTabMerger : IDisposable {
             foreach (IntPtr h in inFlight) skip.Add(h);
         }
         IntPtr best = IntPtr.Zero;
+        // 26H2:主页窗口不登记 ShellWindows,拿它当合并目标会让 TabsSnapshot 读出空串、
+        // 被误判半死态整单放弃 → 只选已登记窗口;枚举失败(null)退化为不过滤(旧行为)
+        HashSet<IntPtr> registered = ComCall(2500, delegate() { return RegisteredExplorerWindows(); }, null);
         EnumWindows(delegate(IntPtr h, IntPtr l) {
             var sb = new StringBuilder(64);
             if (GetClassName(h, sb, 64) != 0 && sb.ToString() == ExplorerWindowClass
-                && !skip.Contains(h) && IsMergeTargetVisible(h)) {
+                && !skip.Contains(h) && IsMergeTargetVisible(h)
+                && (registered == null || registered.Contains(h))) {
                 best = h;
                 return false;                              // EnumWindows 按 z 序先见顶层,取最上面的那个
             }
             return true;
         }, IntPtr.Zero);
         return best;
+    }
+
+    /// <summary>登记在 ShellWindows 里的资源管理器窗口 HWND 集合。null=枚举失败(调用方退化为不过滤)。
+    /// 26H2 起停在主页的窗口不再及时登记(2026-11-03 实测滞后可达小时级),这类窗口的
+    /// 标签对 Shell COM 全不可见,不能作为合并目标。</summary>
+    private static HashSet<IntPtr> RegisteredExplorerWindows() {
+        try {
+            Type t = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+            dynamic shellWindows = Activator.CreateInstance(t);
+            HashSet<IntPtr> set = new HashSet<IntPtr>();
+            try {
+                foreach (dynamic w in shellWindows) {
+                    try {
+                        set.Add(new IntPtr(Convert.ToInt64(w.HWND)));
+                    } catch {
+                    } finally {
+                        try { Marshal.ReleaseComObject(w); } catch { }
+                    }
+                }
+            } finally {
+                try { Marshal.ReleaseComObject(shellWindows); } catch { }
+            }
+            return set;
+        } catch {
+            return null;
+        }
     }
 
     /// <summary>可见且不在别的虚拟桌面——IsWindowVisible 对其它桌面的窗口也返回 true

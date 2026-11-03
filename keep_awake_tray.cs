@@ -11,7 +11,9 @@
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
 //     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11;
-//       开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住)/
+//       开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住;v1.5.7:26H2 起主页窗口
+//       不再及时登记 ShellWindows(实测滞后小时级),改按稳定主页标题判定主页,
+//       关窗复核与目标窗口选择同步适配,详见 explorer_tab_merge.cs)/
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
 //       Keyboard Manager;两条映射各自独立开关,选择持久化 KeepAwakePrefs
 //       v1.4.13。Win(右)含三件套识别:用户
@@ -433,7 +435,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.5.6)");
+        AppLog.Write("启动(v1.5.7)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
