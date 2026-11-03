@@ -820,13 +820,21 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         styleEnd += 8;
         string result = html.Substring(0, styleAt) + html.Substring(styleEnd);
 
-        int scriptAt = result.IndexOf("<script id=\"" + PayloadMarker + "-beacon\">");
-        if (scriptAt >= 0) {
+        // 2026-11-03 修(Claude 复审发现):script 标签可能带属性(外链版
+        // src=...),精确匹配 '<script id="...-beacon">' 剥不中 → 每轮剥旧
+        // 失败又注入新的,外链 script 在模板里疯狂累积(guard.log 每分钟
+        // 「写入 N 份」不收敛)。改前缀匹配 + while 循环剥净存量多份。
+        // 剥时连同前导空白一起吃(payload 内部 style/script 间的换行残留
+        // 会破坏幂等,与 python 侧同步)。
+        while (true) {
+            int scriptAt = result.IndexOf("<script id=\"" + PayloadMarker + "-beacon\"");
+            if (scriptAt < 0) break;
             int scriptEnd = result.IndexOf("</script>", scriptAt);
-            if (scriptEnd >= 0) {
-                scriptEnd += 9;
-                result = result.Substring(0, scriptAt) + result.Substring(scriptEnd);
-            }
+            if (scriptEnd < 0) break;
+            scriptEnd += 9;
+            int cut = scriptAt;
+            while (cut > 0 && (result[cut - 1] == '\n' || result[cut - 1] == ' ' || result[cut - 1] == '\t')) cut--;
+            result = result.Substring(0, cut) + result.Substring(scriptEnd);
         }
         // 与 python 侧 payload.strip_payload 保持逐字节一致(否则两侧会互相
         // 「改写」模板:每轮各写 36 份 12MB 文件,纯 IO 浪费):
