@@ -282,6 +282,12 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             Arguments = "--mode reverse:https://" + UpstreamCName +
                         " --set confdir=\"" + Path.Combine(backend, "mitm") + "\"" +
                         " --set keep_host_header=true" +
+                        // 2026-11-05:腾讯新集群证书只签 CN=mp.weixin.qq.com,不再
+                        // 覆盖 CNAME mpv6 —— mitmproxy 以 mpv6 做 SNI 校验撞新证书
+                        // 节点即 hostname mismatch(11:15-11:29 连发,网络路全黑,
+                        // native 裸版胜出污染缓存)。上游为钉死 IP 的腾讯静态内容,
+                        // 关闭上游证书校验(风险可控:非敏感内容+自控代理+IP 已钉)。
+                        " --set ssl_insecure=true" +
                         " --listen-host 127.0.0.1 --listen-port 443" +
                         " -s \"" + Path.Combine(backend, "wechat_adblock.py") + "\"" +
                         " -q",
