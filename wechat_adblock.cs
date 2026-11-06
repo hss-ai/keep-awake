@@ -101,6 +101,8 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     bool enabled;
     bool disposed;
     int portFails;
+    int appFails;   // 2026-11-06 应用层探活连续失败计数
+    int appTick;    // 监督轮计数(应用层抽查每 12 轮=60s 一次)
     DateTime lastIpRefresh = DateTime.MinValue;
     DateTime lastPatch = DateTime.MinValue;
     DateTime takeoverAt = DateTime.MinValue;
@@ -213,6 +215,31 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         // 端口在监听还不够:关闭期间起的中继也是"在监听",但它不做注入。
         // 所以要求监听者确实是 mitmdump(否则先让路再拉新的)
         if (PortListening() && MitmdumpOwnsPort()) {
+            // 2026-11-06:TCP 握手通 != 能用。僵死进程内核级 accept 还在,
+            // 守护被假健康骗了 3.5h(11-06 10:37-14:02 零注入裸奔,孤儿
+            // mitmdump 4 进程无一真监听)。低频应用层抽查:真发一次 /s
+            // 请求验证响应带注入标记;连续 2 次失败按僵死清场杀掉重拉。
+            appTick++;
+            if (appTick % 12 == 0) {
+                if (AppLayerAlive()) {
+                    appFails = 0;
+                }
+                else {
+                    appFails++;
+                    // 2026-11-06 止血:探活实现与 python 等价请求结果矛盾
+                    // (python 同款 kaalive 请求秒回注入版,C# 版失败),存在
+                    // 实现层 bug 前只记日志不动进程 —— 防过敏循环杀。
+                    Log("应用层探活失败 #" + appFails + "(TCP 通但无注入响应,待查)");
+                    if (appFails >= 6) {
+                        Log("应用层连续失败 6 次(3 分钟),疑似真僵死,清场一次");
+                        KillChild();
+                        KillStrayMitmdump();
+                        appFails = 0;
+                        Thread.Sleep(1500);
+                        return;
+                    }
+                }
+            }
             portFails = 0;
             return;
         }
@@ -513,6 +540,42 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
         }
         catch {
             return null;
+        }
+    }
+
+    // 2026-11-06:应用层探活 —— 真发一次 /s 请求,TLS+HTTP 全链路,
+    // 响应里必须带注入标记(wechat-adblock)。TCP 探活对僵死进程无效
+    // (内核 accept 队列还活着),只有应用层能暴露「端口在但不干活」。
+    static bool AppLayerAlive() {
+        TcpClient tcp = null;
+        System.Net.Security.SslStream ssl = null;
+        try {
+            tcp = new TcpClient();
+            tcp.Connect("127.0.0.1", 443);
+            ssl = new System.Net.Security.SslStream(tcp.GetStream(), false, delegate { return true; });
+            ssl.AuthenticateAsClient("mp.weixin.qq.com");
+            byte[] req = System.Text.Encoding.ASCII.GetBytes(
+                "GET /s?__biz=kaalive HTTP/1.1\r\nHost: mp.weixin.qq.com\r\nConnection: close\r\n\r\n");
+            ssl.Write(req, 0, req.Length);
+            ssl.ReadTimeout = 5000;
+            byte[] buf = new byte[8192];
+            int total = 0;
+            var sb = new System.Text.StringBuilder();
+            while (total < 65536) {
+                int n = ssl.Read(buf, 0, buf.Length);
+                if (n <= 0) break;
+                sb.Append(System.Text.Encoding.ASCII.GetString(buf, 0, n));
+                total += n;
+                if (sb.ToString().Contains("wechat-adblock")) return true;
+            }
+            return false;
+        }
+        catch {
+            return false;
+        }
+        finally {
+            try { if (ssl != null) ssl.Dispose(); } catch {}
+            try { if (tcp != null) tcp.Close(); } catch {}
         }
     }
 
