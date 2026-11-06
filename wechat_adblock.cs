@@ -229,7 +229,7 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
                     // 2026-11-06 止血:探活实现与 python 等价请求结果矛盾
                     // (python 同款 kaalive 请求秒回注入版,C# 版失败),存在
                     // 实现层 bug 前只记日志不动进程 —— 防过敏循环杀。
-                    Log("应用层探活失败 #" + appFails + "(TCP 通但无注入响应,待查)");
+                    Log("应用层探活失败 #" + appFails + " [" + AppLayerFailReason + "]");
                     if (appFails >= 6) {
                         Log("应用层连续失败 6 次(3 分钟),疑似真僵死,清场一次");
                         KillChild();
@@ -546,14 +546,26 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     // 2026-11-06:应用层探活 —— 真发一次 /s 请求,TLS+HTTP 全链路,
     // 响应里必须带注入标记(wechat-adblock)。TCP 探活对僵死进程无效
     // (内核 accept 队列还活着),只有应用层能暴露「端口在但不干活」。
+    static string AppLayerFailReason = "";  // 2026-11-06:探活失败原因留痕(python 等价请求成功而 C# 失败,病因待定位)
+
     static bool AppLayerAlive() {
         TcpClient tcp = null;
         System.Net.Security.SslStream ssl = null;
+        AppLayerFailReason = "";
         try {
             tcp = new TcpClient();
             tcp.Connect("127.0.0.1", 443);
             ssl = new System.Net.Security.SslStream(tcp.GetStream(), false, delegate { return true; });
-            ssl.AuthenticateAsClient("mp.weixin.qq.com");
+            try {
+                // .NET Framework 的 SslStream 默认协议过老,mitmproxy 直接断连
+                // (2026-11-06 病因日志实锤:tls 远程方已关闭传输流)。显式 Tls12。
+                ssl.AuthenticateAsClient("mp.weixin.qq.com", null,
+                    System.Security.Authentication.SslProtocols.Tls12, false);
+            }
+            catch (Exception ex2) {
+                AppLayerFailReason = "tls: " + ex2.Message;
+                return false;
+            }
             byte[] req = System.Text.Encoding.ASCII.GetBytes(
                 "GET /s?__biz=kaalive HTTP/1.1\r\nHost: mp.weixin.qq.com\r\nConnection: close\r\n\r\n");
             ssl.Write(req, 0, req.Length);
@@ -562,15 +574,23 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
             int total = 0;
             var sb = new System.Text.StringBuilder();
             while (total < 65536) {
-                int n = ssl.Read(buf, 0, buf.Length);
+                int n;
+                try { n = ssl.Read(buf, 0, buf.Length); }
+                catch (Exception ex3) {
+                    AppLayerFailReason = "read: " + ex3.Message + " (got " + total + "B)";
+                    return false;
+                }
                 if (n <= 0) break;
                 sb.Append(System.Text.Encoding.ASCII.GetString(buf, 0, n));
                 total += n;
                 if (sb.ToString().Contains("wechat-adblock")) return true;
             }
+            AppLayerFailReason = "no-marker in " + total + "B; head=" +
+                (sb.Length > 120 ? sb.ToString(0, 120) : sb.ToString());
             return false;
         }
-        catch {
+        catch (Exception ex) {
+            AppLayerFailReason = "outer: " + ex.Message;
             return false;
         }
         finally {
