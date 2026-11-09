@@ -106,6 +106,7 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
     DateTime lastIpRefresh = DateTime.MinValue;
     DateTime lastPatch = DateTime.MinValue;
     DateTime takeoverAt = DateTime.MinValue;
+    DateTime lastHeal = DateTime.MinValue;   // 2026-11-09:selfheal 巡检调度(#196 §25)
 
     public WechatAdblockSupervisor(bool startEnabled) {
         enabled = startEnabled;
@@ -164,6 +165,22 @@ internal sealed class WechatAdblockSupervisor : IDisposable {
                     if (DateTime.UtcNow - lastPatch > TimeSpan.FromMinutes(1)) {
                         PatchTemplates();
                         lastPatch = DateTime.UtcNow;
+                    }
+                    // 2026-11-09 自愈层(#196 §25):每 5 分钟后台跑一轮巡检+自动修复
+                    // (venv 重建/全家重启/缓存清理/上游兜底),不阻塞监督循环。
+                    if (DateTime.UtcNow - lastHeal > TimeSpan.FromMinutes(5)) {
+                        lastHeal = DateTime.UtcNow;
+                        try {
+                            var heal = new ProcessStartInfo {
+                                FileName = "python",
+                                Arguments = "\"" + Path.Combine(BackendDir(), "selfheal.py") + "\" --round",
+                                UseShellExecute = false, CreateNoWindow = true
+                            };
+                            Process.Start(heal);
+                        }
+                        catch (Exception hex) {
+                            Log("selfheal 调度失败: " + hex.Message);
+                        }
                     }
                 }
                 else if (!enabled) {
