@@ -10,12 +10,18 @@
 //   - 启动即开启「系统防待机」(屏幕允许自动关),托盘弹气泡提示;
 //   - 左键单击托盘图标 = 开/关切换;图标三态:绿=防待机,蓝=防待机+屏幕常亮,灰=关;
 //   - 右键菜单:✔防待机开启 / ✔屏幕常亮(勾上自动连防待机一起开) /
-//     ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11;
-//       开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住;v1.5.7:26H2 起主页窗口
-//       不再及时登记 ShellWindows(实测滞后小时级),改按稳定主页标题判定主页,
-//       关窗复核与目标窗口选择同步适配;v1.5.8:合并视觉顺滑——新窗冒头即藏、焦点
-//       当场交接给目标窗,放弃合并必还原显示,用户已切走则不抢前台,
-//       详见 explorer_tab_merge.cs)/
+//     功能开关▸(v1.5.9:两个常驻开关折叠进二级菜单,与「键映射」同类、与「更多工具」
+//       里的一次性动作分开,同个子菜单里混「点一下执行」与「点一下翻开关」勾选语义
+//       读不出来)/
+//       ✔资源管理器单窗口合并(新开的资源管理器自动并入既有窗口成标签页,Win11;
+//         开关选择持久化 HKCU KeepAwakePrefs,关过一次就记住;v1.5.7:26H2 起主页窗口
+//         不再及时登记 ShellWindows(实测滞后小时级),改按稳定主页标题判定主页,
+//         关窗复核与目标窗口选择同步适配;v1.5.8:合并视觉顺滑——新窗冒头即藏、焦点
+//         当场交接给目标窗,放弃合并必还原显示,用户已切走则不抢前台,
+//         详见 explorer_tab_merge.cs)/
+//       ✔公众号文章去广告(微信)(v1.5.0:KeepAwake 托管 hosts 反代 + xworker 模板
+//         补丁两层守护,微信升级后模板 60 秒内自动重补;后端缺失时菜单项置灰,
+//         详见 wechat_adblock.cs)/
 //     键映射▸✔F2→Ctrl+W ✔Win(右)→Ctrl(右)(低级键盘钩子,接替 PowerToys
 //       Keyboard Manager;两条映射各自独立开关,选择持久化 KeepAwakePrefs
 //       v1.4.13。Win(右)含三件套识别:用户
@@ -415,14 +421,15 @@ internal sealed class TrayContext : ApplicationContext {
     readonly NotifyIcon tray;    readonly ToolStripMenuItem miState;
     readonly ToolStripMenuItem miOn;
     readonly ToolStripMenuItem miDisplay;
-    readonly ToolStripMenuItem miExplorer;
+    readonly ToolStripMenuItem miExplorer;  // └ 功能开关 → 资源管理器单窗口合并
     readonly ToolStripMenuItem miKeymap;    // 键映射(父项):映射多了,收进二级菜单
     readonly ToolStripMenuItem miKeymapF2;  // └ F2 → Ctrl+W
     readonly ToolStripMenuItem miKeymapWin; // └ Win(右) → Ctrl(右)
     readonly ToolStripMenuItem miAutoStart;
     readonly ToolStripMenuItem miMuteStartup;  // 启动时静音(默认开,持久化 HKCU)
     readonly ToolStripMenuItem miMuteWake;     // 开盖唤醒时静音(默认开,持久化 HKCU,v1.5.6)
-    readonly ToolStripMenuItem miAdblock;      // 公众号文章去广告(v1.5.0,KeepAwake 托管 #196 守卫层)
+    readonly ToolStripMenuItem miAdblock;      // └ 功能开关 → 公众号文章去广告(v1.5.0,KeepAwake 托管 #196 守卫层)
+    readonly ToolStripMenuItem miFeatures;     // 功能开关(父项,v1.5.9):常驻开关折叠进二级菜单
     readonly ToolStripMenuItem miMore;     // 更多工具:非常用功能折叠在此,主菜单保持短
     readonly ToolStripMenuItem miArrow;
     readonly ToolStripMenuItem miKeyboardReset;  // 键盘按键失灵一键修复(v1.4.14)
@@ -437,7 +444,7 @@ internal sealed class TrayContext : ApplicationContext {
     DateTime onSince = DateTime.Now;
 
     public TrayContext() {
-        AppLog.Write("启动(v1.5.8)");
+        AppLog.Write("启动(v1.5.9)");
         PowerHibernateGuard.SelfHealIfPending();
         iconOn = MakeIcon(Color.FromArgb(39, 174, 96));         // 绿:防待机
         iconOnDisplay = MakeIcon(Color.FromArgb(41, 128, 185)); // 蓝:防待机+屏幕常亮
@@ -467,6 +474,13 @@ internal sealed class TrayContext : ApplicationContext {
         miMuteWake.Click += OnToggleMuteWake;
         miAdblock = new ToolStripMenuItem("公众号文章去广告(微信)");
         miAdblock.Click += OnToggleAdblock;
+        // v1.5.9:「资源管理器单窗口合并」与「公众号文章去广告」折叠进「功能开关」二级菜单。
+        // 二者与「键映射」同属常驻型开关(有勾选态、选择持久化、随时可关),与「更多工具」
+        // 里的一次性动作(UAC 提权执行、无勾选态)语义不同——混在一处会让同一子菜单里
+        // 「点一下就执行」与「点一下翻开关」两种行为并排,勾选语义读不出来,故分两处。
+        miFeatures = new ToolStripMenuItem("功能开关");
+        miFeatures.DropDownItems.Add(miExplorer);
+        miFeatures.DropDownItems.Add(miAdblock);
         miArrow = new ToolStripMenuItem("去除快捷方式小箭头");
         miArrow.Click += OnToggleArrow;
         miKeyboardReset = new ToolStripMenuItem("键盘按键失灵…修复");
@@ -481,12 +495,11 @@ internal sealed class TrayContext : ApplicationContext {
         menu.Items.Add(miOn);
         menu.Items.Add(miDisplay);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(miExplorer);
+        menu.Items.Add(miFeatures);
         menu.Items.Add(miKeymap);
         menu.Items.Add(miAutoStart);
         menu.Items.Add(miMuteStartup);
         menu.Items.Add(miMuteWake);
-        menu.Items.Add(miAdblock);
         menu.Items.Add(miMore);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(miExit);
